@@ -1,0 +1,356 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""
+Bike Router for MeeGo Harmattan
+Bicycle routing with multiple backends (Valhalla, ORS, OSRM) + Offline
+Version 3.0.26
+"""
+
+import sys
+import os
+import json
+import subprocess
+import threading
+import codecs
+
+# Qt imports
+from PySide.QtCore import QObject, Slot, Signal, QTimer, QUrl
+from PySide.QtGui import QApplication
+from PySide.QtDeclarative import QDeclarativeView
+
+# Configuration
+CONFIG_DIR = os.path.expanduser("~/.config/valhalla-bike-router")
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
+FAVORITES_FILE = os.path.join(CONFIG_DIR, "favorites.json")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+API_SCRIPT = "/opt/valhalla-bike-router/valhalla_api.py"
+PYTHON3 = "/opt/wunderw/bin/python3.11"
+
+def ensure_config_dir():
+    if not os.path.exists(CONFIG_DIR):
+        try:
+            os.makedirs(CONFIG_DIR)
+        except:
+            pass
+
+
+class NetworkHelper(QObject):
+    """Bridge between QML and Python - network requests and file operations"""
+    
+    locationsReady = Signal(unicode)
+    routeReady = Signal(unicode)
+    routeFileWritten = Signal()
+    errorOccurred = Signal(unicode)
+    
+    def __init__(self, parent=None):
+        super(NetworkHelper, self).__init__(parent)
+        self._pending_locations = None
+        self._pending_route = None
+    
+    def _run_api(self, *args):
+        """Run the Python 3 API script"""
+        try:
+            cmd = [PYTHON3, API_SCRIPT] + list(args)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = proc.communicate()
+            
+            if stderr:
+                print u"API stderr: %s" % stderr.decode('utf-8', 'replace')
+            
+            if stdout:
+                return stdout.decode('utf-8')
+            return json.dumps({"success": False, "error": "No output"})
+        except Exception as e:
+            print u"API error: %s" % e
+            return json.dumps({"success": False, "error": str(e)})
+    
+    # ==================== Location Search ====================
+    
+    @Slot(unicode)
+    def searchLocations(self, query):
+        """Search for locations by name"""
+        print u"Searching locations: %s" % query
+        
+        def worker():
+            self._pending_locations = self._run_api("search_location", query)
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if self._pending_locations is not None:
+                result = self._pending_locations
+                self._pending_locations = None
+                self.locationsReady.emit(result)
+            elif t.is_alive():
+                QTimer.singleShot(100, check)
+            else:
+                self.locationsReady.emit(json.dumps({"success": False, "error": "Request failed"}))
+        
+        QTimer.singleShot(100, check)
+    
+    # ==================== Route Search ====================
+    
+    @Slot(unicode, unicode, unicode, unicode, unicode, unicode, unicode, unicode, unicode)
+    def searchRoute(self, fromLat, fromLng, toLat, toLng, bicycleType, useRoads, useHills, backend, avoidCars):
+        """Search for bicycle route with specified backend"""
+        print u"Searching route: (%s,%s) -> (%s,%s) [%s, backend=%s, avoidCars=%s]" % (fromLat, fromLng, toLat, toLng, bicycleType, backend, avoidCars)
+        
+        def worker():
+            args = ["search_route", fromLat, fromLng, toLat, toLng, bicycleType, useRoads, useHills, backend, avoidCars]
+            self._pending_route = self._run_api(*args)
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        
+        def check():
+            if self._pending_route is not None:
+                result = self._pending_route
+                self._pending_route = None
+                self.routeReady.emit(result)
+            elif t.is_alive():
+                QTimer.singleShot(100, check)
+            else:
+                self.routeReady.emit(json.dumps({"success": False, "error": "Request failed"}))
+        
+        QTimer.singleShot(100, check)
+    
+    # ==================== Bicycle Types & Backends ====================
+    
+    @Slot(result=unicode)
+    def getBicycleTypes(self):
+        """Get available bicycle types"""
+        return self._run_api("bicycle_types")
+    
+    @Slot(result=unicode)
+    def getBackends(self):
+        """Get available routing backends"""
+        return self._run_api("backends")
+    
+    # ==================== Route File for Maps ====================
+    
+    @Slot(unicode)
+    def writeRouteFile(self, jsonData):
+        """Write route data to /tmp/transit_route.json for Nokia Maps"""
+        try:
+            filepath = "/tmp/transit_route.json"
+            with codecs.open(filepath, 'w', encoding='utf-8') as f:
+                f.write(jsonData)
+                f.flush()
+                os.fsync(f.fileno())
+            print u"Wrote route to %s" % filepath
+            self.routeFileWritten.emit()
+        except Exception as e:
+            print u"Error writing route file: %s" % e
+    
+    @Slot(unicode)
+    def openInMaps(self, jsonData):
+        """Write route file and open Nokia Maps with polyline"""
+        try:
+            # Write route file
+            filepath = "/tmp/transit_route.json"
+            with codecs.open(filepath, 'w', encoding='utf-8') as f:
+                f.write(jsonData)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Parse to get center coords
+            route_data = json.loads(jsonData)
+            polyline = route_data.get("polyline", [])
+            
+            if polyline:
+                # Calculate center of route
+                lats = [p["latitude"] for p in polyline]
+                lngs = [p["longitude"] for p in polyline]
+                center_lat = sum(lats) / len(lats)
+                center_lng = sum(lngs) / len(lngs)
+            else:
+                center_lat = route_data.get("start", {}).get("lat", 48.2)
+                center_lng = route_data.get("start", {}).get("lng", 16.3)
+            
+            # Open Nokia Maps with geo URI including file path
+            geo_uri = "geo:%f,%f?action=showPolyline&file=%s" % (center_lat, center_lng, filepath)
+            print u"Opening Maps: %s" % geo_uri
+            
+            subprocess.Popen(["xdg-open", geo_uri])
+            self.routeFileWritten.emit()
+            
+        except Exception as e:
+            print u"Error opening maps: %s" % e
+            self.errorOccurred.emit(unicode(str(e)))
+    
+    # ==================== History ====================
+    
+    @Slot(result=unicode)
+    def getHistory(self):
+        """Get search history"""
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, 'r') as f:
+                    return f.read()
+        except:
+            pass
+        return "[]"
+    
+    @Slot(unicode)
+    def addToHistory(self, locationJson):
+        """Add location to history"""
+        try:
+            ensure_config_dir()
+            history = []
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, 'r') as f:
+                    history = json.load(f)
+            
+            loc = json.loads(locationJson)
+            # Remove duplicates by name
+            history = [h for h in history if h.get('name') != loc.get('name')]
+            history.insert(0, loc)
+            history = history[:20]  # Keep last 20
+            
+            with open(HISTORY_FILE, 'w') as f:
+                json.dump(history, f)
+        except Exception as e:
+            print u"Error saving history: %s" % e
+    
+    @Slot()
+    def clearHistory(self):
+        """Clear search history"""
+        try:
+            if os.path.exists(HISTORY_FILE):
+                os.remove(HISTORY_FILE)
+        except:
+            pass
+    
+    # ==================== Favorites ====================
+    
+    @Slot(result=unicode)
+    def getFavorites(self):
+        """Get saved favorites"""
+        try:
+            if os.path.exists(FAVORITES_FILE):
+                with open(FAVORITES_FILE, 'r') as f:
+                    return f.read()
+        except:
+            pass
+        return "[]"
+    
+    @Slot(unicode, unicode)
+    def addToFavorites(self, name, locationJson):
+        """Add location to favorites with custom name"""
+        try:
+            ensure_config_dir()
+            favorites = []
+            if os.path.exists(FAVORITES_FILE):
+                with open(FAVORITES_FILE, 'r') as f:
+                    favorites = json.load(f)
+            
+            loc = json.loads(locationJson)
+            fav = {
+                'name': name,
+                'location': loc.get('name', name),
+                'lat': loc.get('lat'),
+                'lng': loc.get('lng')
+            }
+            
+            # Remove duplicates
+            favorites = [f for f in favorites if f.get('location') != fav.get('location')]
+            favorites.insert(0, fav)
+            
+            with open(FAVORITES_FILE, 'w') as f:
+                json.dump(favorites, f)
+        except Exception as e:
+            print u"Error saving favorite: %s" % e
+    
+    @Slot(unicode)
+    def removeFromFavorites(self, location):
+        """Remove location from favorites"""
+        try:
+            if os.path.exists(FAVORITES_FILE):
+                with open(FAVORITES_FILE, 'r') as f:
+                    favorites = json.load(f)
+                favorites = [f for f in favorites if f.get('location') != location]
+                with open(FAVORITES_FILE, 'w') as f:
+                    json.dump(favorites, f)
+        except Exception as e:
+            print u"Error removing favorite: %s" % e
+    
+    # ==================== Settings ====================
+    
+    @Slot(result=unicode)
+    def getSettings(self):
+        """Get app settings"""
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    return f.read()
+        except:
+            pass
+        # Default settings
+        return json.dumps({
+            "bicycleType": "Mountain",
+            "useRoads": 0.5,
+            "useHills": 0.5,
+            "backend": "valhalla"
+        })
+    
+    @Slot(unicode)
+    def saveSettings(self, settingsJson):
+        """Save app settings"""
+        try:
+            ensure_config_dir()
+            with open(SETTINGS_FILE, 'w') as f:
+                f.write(settingsJson)
+        except Exception as e:
+            print u"Error saving settings: %s" % e
+    
+    # ==================== Generic Command Runner ====================
+    
+    @Slot(unicode, result=unicode)
+    def runCommand(self, command):
+        """Run a command via the API script and return result synchronously"""
+        try:
+            args = command.split()
+            return self._run_api(*args)
+        except Exception as e:
+            print u"Error running command: %s" % e
+            return json.dumps({"success": False, "error": str(e)})
+
+
+def main():
+    print u"=== Bike Router 3.0.26 Starting ==="
+    
+    app = QApplication(sys.argv)
+    app.setApplicationName("Bike Router")
+    
+    view = QDeclarativeView()
+    view.setWindowTitle("Bike Router")
+    
+    # Create network helper
+    helper = NetworkHelper()
+    view.rootContext().setContextProperty("networkHelper", helper)
+    
+    # Load QML
+    qml_path = "/opt/valhalla-bike-router/qml/main.qml"
+    print u"Loading QML from: %s" % qml_path
+    view.setSource(QUrl.fromLocalFile(qml_path))
+    
+    if view.status() == QDeclarativeView.Error:
+        print u"QML Error!"
+        for error in view.errors():
+            print u"  %s" % error.toString()
+        return 1
+    
+    view.showFullScreen()
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

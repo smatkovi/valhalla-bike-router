@@ -1,0 +1,17 @@
+#!/bin/sh
+# Post-installation script for valhalla-bike-router
+
+# Stop any running local routing server (to reload new code)
+pkill -f "valhalla_local_engine" 2>/dev/null && echo "Stopped old routing server."
+
+# Also try to kill by port
+fuser -k 8553/tcp 2>/dev/null || true
+
+# Only delete cache files older than current tiles (stale cache)
+# Don't delete all cache - it takes too long to rebuild on ARM
+CACHE_DIR="/home/user/MyDocs/Maps.OSM/valhalla/tiles/.cache"
+if [ -d "$CACHE_DIR" ]; then
+    echo "Note: Tile cache preserved. Delete $CACHE_DIR manually if routing issues occur."
+fi
+
+exit 0

@@ -1,0 +1,15 @@
+Package: valhalla-bike-router
+Version: 3.0.28
+Section: user/navigation
+Priority: optional
+Architecture: all
+Depends: python, python-pyside.qtcore, python-pyside.qtgui, python-pyside.qtdeclarative
+Maintainer: Sebastian <sebastian@example.com>
+Description: Bicycle Router with Valhalla - OFFLINE
+ Bicycle routing for MeeGo Harmattan with full OFFLINE support!
+ v3.0.26: Better error logging for downloads. Uses local JSON.
+ Shows detailed error messages. Progress bar during download.
+ Hierarchical region browser (Continent > Country > Subregion).
+ Supports Mountain, Road, Hybrid and Cyclocross profiles.
+XSBC-Maemo-Display-Name: Bike Router
+XB-Maemo-Icon-26: iVBORw0KGgoAAAANSUhEUgAAABoAAAAaCAYAAACpSkzOAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAOxAAADsQBlSsOGwAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAKmSURBVEiJ7ZZLSFRhFMd/987cO+M4M+M4PtKxzEdWZGYPKoKCaBMFtWgRRC2CoEVQq6BVi2gVtAiiTYugVdCmVRAVLYKgRYuIoB4U9sAyszKn0dGZuXPvbbHKce7cO2OLDvzhu+c7//8533d4CFKksrKyzJN6aHxvcdGAM6GXZL0I7KutrZdFkUQR8GYJbKuOZVQkLmUiUKFEq+s6O/f9/P+IxrIj5lTOiWgakJbF6bBN1JqZKTn+iGzP7cw7F7NqKiLUJWvMDAC77X+fNB/jqKRrqYL7G7FxTxSPzgJsMiaSJ+eHSL85HM8OU2dLtQ/jdJBogBcXcfB1F1JdB9bkILI2dAyWJgH5P1p5oJQu6HVg3Y5xNHO6bYhswzd9Fw7jSBgLnwdIH9Yy6ZF+0H3+UaTkBAjSZfXVUNcLPBp8DNbgOYDFPD8wPPiIrK+9CGa+0KmTcWyBCFXQzSg6H2C90K2DCOQf+EnH6wXwfxFRVQFoNWBt/IAtXhNgP3RjoLXB15Gm/QJsDO0IcGfYmniI6LqBKLoJ2BLCJjG9eGwfgF/HsgLYGPIkGCIqPoFo1nkYoqQE4i3wA7DT+GqCpQdBVANMCD0BvhsXiOo7gILhp8B0fkM4LbQcQHDOBwC9BdaTCPwDWBuyhghJgE0hK0I5CWRYcwWw0eJ5QHYi8Bm4KmyIXgLqh8hhL0NIZ0APgCsJZFg/8nWPAMlD+wHUDd0KcKWE8wME6Z/ArwEeg98ANofuDrGlpA

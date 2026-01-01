@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Bike Router
+Comment=Bicycle routing with Valhalla (Mountain, Road, Hybrid, Cross)
+Icon=/usr/share/icons/hicolor/80x80/apps/valhalla-bike-router.png
+Exec=/opt/valhalla-bike-router/valhalla-bike-router
+Terminal=false
+Categories=Utility;Navigation;
+X-Maemo-Orientation=Automatic
