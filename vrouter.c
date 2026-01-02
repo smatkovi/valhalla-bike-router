@@ -37,15 +37,16 @@
 #define LEVEL_1_SIZE 1.0
 #define LEVEL_2_SIZE 0.25
 
-#define kPedestrianAccess 2  /* Pedestrian access bit mask (bit 1) */
-#define kBicycleAccess 4  /* Bicycle access bit mask (bit 2) */
+#define kPedestrianAccess 1  /* Bit 0: Pedestrian access */
+#define kBicycleAccess 2     /* Bit 1: Bicycle access */
+#define kCarAccess 4         /* Bit 2: Car access */
 
 #define MAX_TILES 100
 #define MAX_NODES_PER_TILE 200000
 #define MAX_EDGES_PER_TILE 500000
-#define MAX_HEAP 1000000
-#define MAX_VISITED 1000003  /* Prime number, ~32MB for hash table */
-#define MAX_PATH 50000
+#define MAX_HEAP 4000000
+#define MAX_VISITED 4000037  /* Prime number, ~128MB for hash table */
+#define MAX_PATH 100000
 
 #define EARTH_RADIUS 6371000.0
 #define DEG_TO_RAD (M_PI / 180.0)
@@ -443,24 +444,64 @@ static int count_usable_edges(Tile *t, uint32_t node_id) {
 static int find_nearest_node(Tile *t, double lat, double lon, uint32_t *out_node) {
     if (!t || t->node_count == 0) return 0;
     
-    double best_dist = 1e18;
-    uint32_t best_node = 0;
+    /* First pass: find absolute closest node */
+    double closest_dist = 1e18;
+    uint32_t closest_node = 0;
     
-    /* Simple: find closest node (like Python) */
     for (uint32_t i = 0; i < t->node_count; i++) {
         double d = haversine(lat, lon, t->nodes[i].lat, t->nodes[i].lon);
-        if (d < best_dist) {
-            best_dist = d;
-            best_node = i;
+        if (d < closest_dist) {
+            closest_dist = d;
+            closest_node = i;
         }
     }
     
-    if (best_dist > 5000) return 0;  /* Max 5km from road */
+    if (closest_dist > 5000) return 0;  /* Max 5km from road */
     
-    int edges = count_usable_edges(t, best_node);
+    int closest_edges = count_usable_edges(t, closest_node);
+    
+    /* If closest node has good connectivity (3+ edges), use it */
+    if (closest_edges >= 3) {
+        *out_node = closest_node;
+        fprintf(stderr, "[DEBUG] find_nearest_node: node=%u dist=%.1fm edges=%d (good)\n", 
+                closest_node, closest_dist, closest_edges);
+        return 1;
+    }
+    
+    /* Closest node might be a dead-end, find better alternative within 500m */
+    double best_score = 1e18;
+    uint32_t best_node = closest_node;
+    int best_edges = closest_edges;
+    double best_dist = closest_dist;
+    
+    /* Search radius: max 500m or 3x closest distance */
+    double search_radius = closest_dist * 3;
+    if (search_radius < 500) search_radius = 500;
+    if (search_radius > 2000) search_radius = 2000;
+    
+    for (uint32_t i = 0; i < t->node_count; i++) {
+        double d = haversine(lat, lon, t->nodes[i].lat, t->nodes[i].lon);
+        if (d > search_radius) continue;
+        
+        int edges = count_usable_edges(t, i);
+        if (edges < 2) continue;  /* Skip dead-ends */
+        
+        /* Score: prefer more edges, but penalize distance */
+        /* Lower score is better */
+        double edge_bonus = (edges >= 3) ? 0.5 : (edges >= 2) ? 0.8 : 1.0;
+        double score = d * edge_bonus;
+        
+        if (score < best_score) {
+            best_score = score;
+            best_node = i;
+            best_edges = edges;
+            best_dist = d;
+        }
+    }
+    
     *out_node = best_node;
-    fprintf(stderr, "[DEBUG] find_nearest_node: node=%u dist=%.1fm edges=%d\n", 
-            best_node, best_dist, edges);
+    fprintf(stderr, "[DEBUG] find_nearest_node: node=%u dist=%.1fm edges=%d (closest was %u dist=%.1fm edges=%d)\n", 
+            best_node, best_dist, best_edges, closest_node, closest_dist, closest_edges);
     return 1;
 }
 
@@ -625,13 +666,21 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
     visited_set(start_state, null_state, 0, 0);
     
     int iterations = 0;
-    int max_iterations = 300000;
+    int max_iterations = 4000000;  /* Default for very long routes */
     
-    /* Adaptive max based on distance */
+    /* Adaptive max based on distance - doubled for safety */
     double dist_km = haversine(from_lat, from_lon, to_lat, to_lon) / 1000.0;
-    if (dist_km < 5) max_iterations = 50000;
-    else if (dist_km < 20) max_iterations = 100000;
-    else if (dist_km < 50) max_iterations = 200000;
+    if (dist_km < 5) max_iterations = 150000;
+    else if (dist_km < 20) max_iterations = 400000;
+    else if (dist_km < 50) max_iterations = 800000;
+    else if (dist_km < 100) max_iterations = 1200000;
+    else if (dist_km < 200) max_iterations = 1800000;
+    else if (dist_km < 300) max_iterations = 2500000;
+    else if (dist_km < 400) max_iterations = 3000000;
+    else if (dist_km < 500) max_iterations = 3500000;
+    else if (dist_km < 600) max_iterations = 3800000;
+    
+    fprintf(stderr, "[DEBUG] Distance: %.1f km, max_iterations: %d\n", dist_km, max_iterations);
     
     while (g_heap_size > 0 && iterations < max_iterations) {
         iterations++;
@@ -735,7 +784,13 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
         if (iterations <= 10) {
             fprintf(stderr, "[DEBUG] Iter %d: expanding node %u (edge_index=%u count=%u, edges %u-%u)\n", 
                 iterations, cs.node_id, node->edge_index, node->edge_count, start_edge, end_edge);
+            fflush(stderr);
         }
+        
+        int edges_added = 0;
+        int edges_skip_level = 0;
+        int edges_skip_visited = 0;
+        int edges_skip_tile = 0;
         
         for (uint32_t ei = start_edge; ei < end_edge; ei++) {
             EdgeEnd *ee = &tile->edge_ends[ei];
@@ -745,20 +800,26 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
                 size_t raw_off = tile->edges_offset + ei * EDGE_SIZE;
                 if (ei == start_edge) {
                     fprintf(stderr, "[DEBUG] First edge offset: %zu (file size: %zu)\n", raw_off, tile->raw_size);
+                    fflush(stderr);
                 }
-                uint64_t raw_w3 = read_u64(tile->raw_data, raw_off + 24);
                 uint64_t raw_w4 = read_u64(tile->raw_data, raw_off + 32);
-                uint32_t fwd = raw_w3 & 0xFFF;
                 uint32_t length = (raw_w4 >> 32) & 0xFFFFFF;
-                fprintf(stderr, "[DEBUG] Edge %u: tile=%u->%u node=%u bike=%d ped=%d len=%um\n",
-                    ei, tile->tile_id, ee->end_tile_id, ee->end_node_id, ee->has_bike, ee->has_ped, length);
+                fprintf(stderr, "[DEBUG] Edge %u: tile=%u->%u node=%u level=%d bike=%d ped=%d len=%um\n",
+                    ei, tile->tile_id, ee->end_tile_id, ee->end_node_id, ee->end_level, ee->has_bike, ee->has_ped, length);
+                fflush(stderr);
             }
             
             /* Only follow edges to valid levels (0, 1, 2) */
-            if (ee->end_level > 2) continue;
+            if (ee->end_level > 2) {
+                edges_skip_level++;
+                continue;
+            }
             
             /* For now, stay on level 2 only (no hierarchy) */
-            if (ee->end_level != 2) continue;
+            if (ee->end_level != 2) {
+                edges_skip_level++;
+                continue;
+            }
             
             /* Get edge details */
             EdgeDetails ed;
@@ -787,23 +848,21 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
             
             State ns = { ee->end_level, ee->end_tile_id, ee->end_node_id };
             
-            /* Skip edges to different levels (transitions) - they're for hierarchical routing */
-            if (ee->end_level != cs.level) {
-                if (iterations <= 100) {
-                    fprintf(stderr, "[DEBUG] Skipping transition edge from level %d to %d\n",
-                        cs.level, ee->end_level);
-                }
-                continue;
-            }
-            
             /* Check if better path */
             VisitedEntry *nve = visited_get(ns);
-            if (nve && new_g >= nve->g) continue;
+            if (nve && new_g >= nve->g) {
+                edges_skip_visited++;
+                continue;
+            }
             
             /* Get neighbor coordinates for heuristic - skip edges to missing tiles */
             Tile *ntile = load_tile(ns.level, ns.tile_id);
             if (!ntile || ns.node_id >= ntile->node_count) {
-                /* Edge goes to non-existent tile - skip silently */
+                edges_skip_tile++;
+                if (iterations <= 10) {
+                    fprintf(stderr, "[DEBUG] Edge %u: skip - tile %u not found or node %u >= %u\n",
+                        ei, ns.tile_id, ns.node_id, ntile ? ntile->node_count : 0);
+                }
                 continue;
             }
             
@@ -825,14 +884,17 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
             
             HeapEntry ne = { new_g + h, new_g, 0, new_dist, ns };
             heap_push(ne);
+            edges_added++;
         }
         
         if (iterations <= 10) {
-            fprintf(stderr, "[DEBUG] Iter %d done: heap_size=%d\n", iterations, g_heap_size);
+            fprintf(stderr, "[DEBUG] Iter %d done: heap_size=%d (added=%d, skip: level=%d visited=%d tile=%d)\n", 
+                iterations, g_heap_size, edges_added, edges_skip_level, edges_skip_visited, edges_skip_tile);
         }
     }
     
     fprintf(stderr, "[ROUTE] No route found after %d iterations (heap_size=%d)\n", iterations, g_heap_size);
+    fprintf(stderr, "[DEBUG] Hash stats: entries=%d collisions=%d\n", g_visited_count, g_visited_collisions);
     return 0;
 }
 
