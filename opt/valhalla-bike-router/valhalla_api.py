@@ -20,6 +20,18 @@ import urllib.parse
 import ssl
 from datetime import datetime
 
+# Import offline geocoder (optional)
+try:
+    from geocoder_offline import search_offline, is_offline_available, reverse_geocode_offline
+    OFFLINE_GEOCODER_AVAILABLE = True
+    print("[API] Offline geocoder module loaded", file=sys.stderr)
+except ImportError as e:
+    OFFLINE_GEOCODER_AVAILABLE = False
+    print(f"[API] Offline geocoder not available: {e}", file=sys.stderr)
+    def search_offline(*args, **kwargs): return []
+    def is_offline_available(*args, **kwargs): return False
+    def reverse_geocode_offline(*args, **kwargs): return []
+
 # SSL context
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -140,11 +152,11 @@ def decode_polyline(encoded, precision=6):
 
 
 # =============================================================================
-# GEOCODING (Photon)
+# GEOCODING (Offline + Online Fallback)
 # =============================================================================
 
-def search_location(query):
-    """Search for location using Photon (Komoot's geocoder)."""
+def search_location_online(query):
+    """Search for location using Photon (Komoot's online geocoder)."""
     try:
         base_url = "https://photon.komoot.io/api/"
         params = {
@@ -195,13 +207,119 @@ def search_location(query):
                 'lat': coords[1],
                 'lng': coords[0],
                 'type': props.get('osm_value', ''),
+                'source': 'online'
             })
         
-        return {'success': True, 'locations': locations}
+        return {'success': True, 'locations': locations, 'source': 'online'}
         
     except Exception as e:
-        log(f"Location search error: {e}")
-        return {'success': False, 'error': str(e)}
+        log(f"Online location search error: {e}")
+        return {'success': False, 'error': str(e), 'source': 'online'}
+
+
+def search_location_offline_server(query, limit=10):
+    """Search using the local server's cached geocoder (fast!)"""
+    try:
+        # Ensure local server is running
+        if not ensure_local_server():
+            log("[GEOCODER] Could not start local server for offline search")
+            return []
+        
+        # Use local server for offline search (libpostal is cached there)
+        url = ROUTING_BACKENDS['local']['url'] + "/geocode?q=" + urllib.parse.quote(query) + "&limit=" + str(limit)
+        req = urllib.request.Request(url)
+        req.add_header('User-Agent', 'BikeRouter/1.0')
+        
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+        
+        if data.get('success') and data.get('locations'):
+            return data['locations']
+        return []
+    except Exception as e:
+        log(f"[GEOCODER] Server offline search error: {e}")
+        return []
+
+
+def search_location(query, prefer_offline=False, near_lat=None, near_lon=None):
+    """
+    Search for location using online geocoder first, offline fallback if no connection.
+    
+    Args:
+        query: Search string
+        prefer_offline: If True, skip online and use offline directly
+        near_lat, near_lon: Optional coordinates for proximity sorting
+        
+    Returns:
+        dict with 'success', 'locations', 'source' keys
+    """
+    locations = []
+    source = 'none'
+    
+    # Try online first (unless prefer_offline is set)
+    if not prefer_offline:
+        online_result = search_location_online(query)
+        if online_result.get('success') and online_result.get('locations'):
+            locations = online_result['locations']
+            source = 'online'
+            log(f"[GEOCODER] Online search returned {len(locations)} results")
+            return {
+                'success': True,
+                'locations': locations,
+                'source': source,
+                'offline_available': is_offline_available()
+            }
+        else:
+            # Online failed (no network?) - try offline
+            log(f"[GEOCODER] Online search failed, trying offline fallback")
+    
+    # Try offline via local server (fast - libpostal is cached!)
+    log(f"[GEOCODER] Trying server-based offline search...")
+    try:
+        server_results = search_location_offline_server(query, limit=10)
+        if server_results:
+            log(f"[GEOCODER] Server offline search returned {len(server_results)} results")
+            return {
+                'success': True,
+                'locations': server_results,
+                'source': 'offline',
+                'offline_available': True
+            }
+    except Exception as e:
+        log(f"[GEOCODER] Server offline search failed: {e}")
+    
+    # Fallback to direct offline (slow - loads libpostal each time)
+    offline_avail = is_offline_available()
+    log(f"[GEOCODER] Fallback to direct offline, available={offline_avail}")
+    
+    if offline_avail:
+        try:
+            offline_results = search_offline(query, limit=10, 
+                                            near_lat=near_lat, near_lon=near_lon)
+            log(f"[GEOCODER] Direct offline search for '{query}' returned {len(offline_results)} results")
+            if offline_results:
+                locations = offline_results
+                source = 'offline'
+        except Exception as e:
+            import traceback
+            log(f"[GEOCODER] Direct offline search error: {e}")
+            log(f"[GEOCODER] {traceback.format_exc()}")
+    
+    return {
+        'success': len(locations) > 0,
+        'locations': locations,
+        'source': source,
+        'offline_available': offline_avail
+    }
+
+
+def get_geocoder_status():
+    """Get geocoder status information."""
+    return {
+        'offline_available': is_offline_available(),
+        'offline_module': OFFLINE_GEOCODER_AVAILABLE,
+        'online_available': True  # Always available if network works
+    }
 
 
 # =============================================================================
@@ -975,6 +1093,30 @@ def get_download_status():
         return {'success': True, 'downloads': {}, 'server_running': False, 'error': str(e)}
 
 
+def start_update(region_id):
+    """Start updating/repairing an installed region - downloads missing geocoder/libpostal"""
+    print("[API] start_update called with region_id: %s" % region_id, file=sys.stderr)
+    
+    if not ensure_local_server():
+        print("[API] Could not start local server", file=sys.stderr)
+        return {'success': False, 'error': 'Could not start local server'}
+    
+    try:
+        url = ROUTING_BACKENDS['local']['url'] + "/update/" + region_id
+        print("[API] Calling URL: %s" % url, file=sys.stderr)
+        req = urllib.request.Request(url)
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            print("[API] Server response: %s" % data, file=sys.stderr)
+            return {'success': True, 'status': data.get('status'), 'region': region_id}
+    except Exception as e:
+        print("[API] Error: %s" % e, file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return {'success': False, 'error': str(e)}
+
+
 # =============================================================================
 # CLI INTERFACE
 # =============================================================================
@@ -994,7 +1136,8 @@ if __name__ == "__main__":
                     "regions - List available regions for download",
                     "tiles - List installed tiles",
                     "download <region_id> - Start download",
-                    "download_status - Check download progress"
+                    "download_status - Check download progress",
+                    "update <region_id> - Update/repair installed region"
                 ]
             }))
             sys.exit(1)
@@ -1072,6 +1215,17 @@ if __name__ == "__main__":
         
         elif cmd == "download_status":
             result = get_download_status()
+            print(json.dumps(result, ensure_ascii=False))
+        
+        elif cmd == "update":
+            print("[API CLI] update command received", file=sys.stderr)
+            if len(sys.argv) < 3:
+                print(json.dumps({"error": "Region ID required"}))
+                sys.exit(1)
+            region_id = sys.argv[2]
+            print("[API CLI] Updating region: %s" % region_id, file=sys.stderr)
+            result = start_update(region_id)
+            print("[API CLI] Update result: %s" % result, file=sys.stderr)
             print(json.dumps(result, ensure_ascii=False))
         
         else:

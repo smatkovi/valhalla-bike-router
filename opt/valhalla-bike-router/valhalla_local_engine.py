@@ -1571,6 +1571,76 @@ def encode_polyline(coords, precision=6):
 MODRANA_BASE = "https://data.modrana.org/osm_scout_server"
 COUNTRIES_JSON_URL = MODRANA_BASE + "/countries_provided.json"
 VALHALLA_PACKAGES_URL = MODRANA_BASE + "/valhalla-33/valhalla/packages"
+GEOCODER_NLP_BASE = MODRANA_BASE + "/geocoder-nlp-39/geocoder-nlp"
+
+# Geocoder files to download (bz2 compressed)
+GEOCODER_FILES = [
+    'geonlp-primary.sqlite.bz2',
+    'geonlp-normalized.trie.bz2', 
+    'geonlp-normalized-id.kch.bz2'
+]
+
+# libpostal global data (for ML-based address parsing)
+LIBPOSTAL_BASE_URL = MODRANA_BASE + "/postal-global-2/postal/global-v1"
+LIBPOSTAL_DATA_DIR = "/home/user/MyDocs/Maps.OSM/postal/global-v1"
+LIBPOSTAL_FILES = [
+    ('address_expansions', 'address_dictionary.dat'),
+    ('language_classifier', 'language_classifier.dat'),
+    ('numex', 'numex.dat'),
+    ('transliteration', 'transliteration.dat'),
+]
+
+# libpostal country-specific parser data
+LIBPOSTAL_PARSER_BASE_URL = MODRANA_BASE + "/postal-country-2/postal/countries-v1"
+LIBPOSTAL_PARSER_DIR = "/home/user/MyDocs/Maps.OSM/postal/countries-v1"
+LIBPOSTAL_PARSER_FILES = [
+    'address_parser_crf.dat',
+    'address_parser_phrases.dat',
+    'address_parser_postal_codes.dat',
+    'address_parser_vocab.trie',
+]
+
+# Map region_id to ISO country code for libpostal parser
+# This maps modrana region names to the ISO codes used by libpostal
+REGION_TO_ISO = {
+    'europe/austria': 'AT',
+    'europe/hungary': 'HU',
+    'europe/germany': 'DE',
+    'europe/switzerland': 'CH',
+    'europe/czech-republic': 'CZ',
+    'europe/slovakia': 'SK',
+    'europe/poland': 'PL',
+    'europe/italy': 'IT',
+    'europe/france': 'FR',
+    'europe/spain': 'ES',
+    'europe/portugal': 'PT',
+    'europe/netherlands': 'NL',
+    'europe/belgium': 'BE',
+    'europe/united-kingdom': 'GB',
+    'europe/ireland': 'GB-IE',
+    'europe/sweden': 'SE',
+    'europe/norway': 'NO',
+    'europe/finland': 'FI',
+    'europe/denmark': 'DK',
+    'europe/greece': 'GR',
+    'europe/croatia': 'HR',
+    'europe/slovenia': 'SI',
+    'europe/serbia': 'RS',
+    'europe/romania': 'RO',
+    'europe/bulgaria': 'BG',
+    'europe/ukraine': 'UA',
+    'europe/russia': 'RU',
+    'europe/liechtenstein': 'LI',
+    'europe/luxembourg': 'LU',
+    'europe/azores': 'PT',  # Part of Portugal
+    'north-america/usa': 'US',
+    'north-america/canada': 'CA',
+    'asia/japan': 'JP',
+    'asia/china': 'CN',
+    'asia/india': 'IN',
+    'australia-oceania/australia': 'AU',
+    'australia-oceania/new-zealand': 'NZ',
+}
 
 try:
     from urllib.request import urlopen, Request
@@ -1631,6 +1701,40 @@ class DownloadManager:
                 return False
         
         return True
+    
+    def _ensure_dir(self, dir_path):
+        """Ensure directory exists, removing any files that block the path.
+        
+        This handles the case where a file exists where a directory should be.
+        For example, if /a/b is a file but we need /a/b/c.txt, we delete /a/b first.
+        """
+        if os.path.exists(dir_path):
+            if os.path.isdir(dir_path):
+                return  # Already a directory, nothing to do
+            else:
+                # It's a file, remove it
+                os.remove(dir_path)
+        
+        # Check each parent path component
+        parts = dir_path.split(os.sep)
+        current = ""
+        for part in parts:
+            if not part:
+                current = os.sep
+                continue
+            current = os.path.join(current, part)
+            if os.path.exists(current):
+                if not os.path.isdir(current):
+                    # File blocking the path, remove it
+                    os.remove(current)
+                    os.makedirs(current)
+            else:
+                os.makedirs(current)
+                break  # makedirs will create the rest
+        
+        # Final makedirs for remaining path
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
     
     def get_installed_regions(self):
         """Get list of installed region IDs"""
@@ -1765,6 +1869,140 @@ class DownloadManager:
         thread.start()
         
         return {'status': 'started', 'region': region_id}
+    
+    def update_region(self, region_id, callback=None):
+        """Update/repair an installed region - download missing geocoder/libpostal files"""
+        with self.lock:
+            if region_id in self.downloads and self.downloads[region_id].get('status') == 'downloading':
+                return {'error': 'Already downloading'}
+            self.downloads[region_id] = {'progress': 0, 'status': 'checking'}
+        
+        def do_update():
+            try:
+                self._update_region_impl(region_id, callback)
+            except Exception as e:
+                with self.lock:
+                    self.downloads[region_id] = {'progress': 0, 'status': 'error', 'error': str(e)}
+        
+        thread = threading.Thread(target=do_update)
+        thread.daemon = True
+        thread.start()
+        
+        return {'status': 'started', 'region': region_id}
+    
+    def _check_geocoder_files(self, region_id):
+        """Check if geocoder-nlp files exist for a region."""
+        geocoder_region = region_id.replace('/', '-')
+        geocoder_base = '/home/user/MyDocs/Maps.OSM/geocoder-nlp'
+        geocoder_dir = os.path.join(geocoder_base, geocoder_region)
+        
+        expected_files = [f.replace('.bz2', '') for f in GEOCODER_FILES]
+        
+        if not os.path.exists(geocoder_dir):
+            return False, []
+        
+        missing = []
+        for f in expected_files:
+            if not os.path.exists(os.path.join(geocoder_dir, f)):
+                missing.append(f)
+        
+        return len(missing) == 0, missing
+    
+    def _update_region_impl(self, region_id, callback=None):
+        """Check and download missing files for an installed region."""
+        import sys
+        
+        def log(msg):
+            print(msg)
+            sys.stdout.flush()
+        
+        log("[UPDATE] Checking region: %s" % region_id)
+        
+        updates_needed = []
+        
+        # Check libpostal global data
+        libpostal_ok = self._check_libpostal_data()
+        if not libpostal_ok:
+            updates_needed.append('libpostal')
+            log("[UPDATE] libpostal data missing")
+        else:
+            log("[UPDATE] libpostal data OK")
+        
+        # Check country-specific parser
+        iso_code = self._get_iso_code(region_id)
+        parser_ok = True
+        if iso_code:
+            parser_ok = self._check_parser_data(iso_code)
+            if not parser_ok:
+                updates_needed.append('parser')
+                log("[UPDATE] parser data for %s missing" % iso_code)
+            else:
+                log("[UPDATE] parser data for %s OK" % iso_code)
+        else:
+            log("[UPDATE] No ISO code for %s, skipping parser check" % region_id)
+        
+        # Check geocoder
+        geocoder_ok, missing_geocoder = self._check_geocoder_files(region_id)
+        if not geocoder_ok:
+            updates_needed.append('geocoder')
+            log("[UPDATE] geocoder files missing: %s" % missing_geocoder)
+        else:
+            log("[UPDATE] geocoder files OK")
+        
+        if not updates_needed:
+            log("[UPDATE] Region %s is up to date, nothing to do" % region_id)
+            with self.lock:
+                self.downloads[region_id] = {
+                    'progress': 100,
+                    'status': 'complete',
+                    'message': 'Already up to date'
+                }
+            return
+        
+        log("[UPDATE] Updates needed: %s" % updates_needed)
+        
+        # Download libpostal if missing
+        if 'libpostal' in updates_needed:
+            with self.lock:
+                self.downloads[region_id] = {
+                    'progress': 20,
+                    'status': 'Downloading libpostal data...'
+                }
+            libpostal_ok = self._download_libpostal_data(log)
+        
+        # Download parser if missing
+        if 'parser' in updates_needed:
+            with self.lock:
+                self.downloads[region_id] = {
+                    'progress': 40,
+                    'status': 'Downloading parser data...'
+                }
+            parser_ok = self._download_parser_data(region_id, log)
+        
+        # Download geocoder if missing
+        if 'geocoder' in updates_needed:
+            with self.lock:
+                self.downloads[region_id] = {
+                    'progress': 60,
+                    'status': 'Downloading geocoder...'
+                }
+            geocoder_ok = self._download_geocoder(region_id, log)
+        
+        log("[UPDATE] Region %s update complete. Libpostal: %s, Parser: %s, Geocoder: %s" % (
+            region_id,
+            'OK' if libpostal_ok else 'FAILED',
+            'OK' if parser_ok else 'FAILED',
+            'OK' if geocoder_ok else 'FAILED'
+        ))
+        
+        with self.lock:
+            self.downloads[region_id] = {
+                'progress': 100,
+                'status': 'complete'
+            }
+        
+        if callback:
+            callback(region_id, 'complete')
     
     def _download_region_impl(self, region_id, callback=None):
         """Download all packages for a region"""
@@ -1902,12 +2140,13 @@ class DownloadManager:
                 extracted_tiles = []  # Track tiles from this package
                 
                 try:
-                    # Python's bz2 module may not be available in wunderw, use system python
+                    # Python's bz2 module may not be available in wunderw, use system python or bunzip2
                     tar_uncompressed = tar_path.replace('.tar.bz2', '.tar')
                     
-                    # Decompress with system python (has bz2 module)
                     log("[DOWNLOAD] Decompressing package %s..." % pkg_num)
                     import subprocess
+                    
+                    # Try system python first (has bz2 module)
                     decompress_script = '''
 import bz2
 import sys
@@ -1920,7 +2159,16 @@ with open(sys.argv[1], 'rb') as f_in:
                         capture_output=True
                     )
                     if result.returncode != 0:
-                        raise Exception("bz2 decompress failed: %s" % result.stderr.decode())
+                        # Fallback to bunzip2
+                        log("[DOWNLOAD] Python bz2 failed, trying bunzip2...")
+                        with open(tar_uncompressed, 'wb') as f_out:
+                            result = subprocess.run(
+                                ['bunzip2', '-c', tar_path],
+                                stdout=f_out,
+                                stderr=subprocess.PIPE
+                            )
+                            if result.returncode != 0:
+                                raise Exception("bunzip2 failed: %s" % result.stderr.decode())
                     
                     log("[DOWNLOAD] Decompressed, opening tar...")
                     
@@ -1962,8 +2210,7 @@ with open(sys.argv[1], 'rb') as f_in:
                                     out_path = os.path.join(self.tiles_dir, parts[i], parts[i+1], parts[i+2])
                                     out_dir = os.path.dirname(out_path)
                                     
-                                    if not os.path.exists(out_dir):
-                                        os.makedirs(out_dir)
+                                    self._ensure_dir(out_dir)
                                     
                                     f = tar.extractfile(member)
                                     if f:
@@ -1982,8 +2229,7 @@ with open(sys.argv[1], 'rb') as f_in:
                                     out_path = os.path.join(self.tiles_dir, parts[i], parts[i+1], parts[i+2], parts[i+3])
                                     out_dir = os.path.dirname(out_path)
                                     
-                                    if not os.path.exists(out_dir):
-                                        os.makedirs(out_dir)
+                                    self._ensure_dir(out_dir)
                                     
                                     f = tar.extractfile(member)
                                     if f:
@@ -2050,7 +2296,57 @@ with open(sys.argv[1], 'rb') as f_in:
             except:
                 pass
             
-            log("[DOWNLOAD] SUCCESS! Region %s complete. Tiles: %d, Packages: %d" % (region_id, tiles_extracted, downloaded_packages))
+            # Download libpostal data for smart address parsing (once, shared by all regions)
+            if not self._check_libpostal_data():
+                log("[DOWNLOAD] Downloading libpostal data for smart address parsing...")
+                with self.lock:
+                    self.downloads[region_id] = {
+                        'progress': 90,
+                        'status': 'Downloading libpostal data...',
+                        'tiles_extracted': tiles_extracted,
+                        'packages_downloaded': downloaded_packages
+                    }
+                libpostal_ok = self._download_libpostal_data(log)
+            else:
+                log("[DOWNLOAD] Libpostal data already present")
+                libpostal_ok = True
+            
+            # Download country-specific parser data
+            iso_code = self._get_iso_code(region_id)
+            if iso_code and not self._check_parser_data(iso_code):
+                log("[DOWNLOAD] Downloading parser data for %s..." % iso_code)
+                with self.lock:
+                    self.downloads[region_id] = {
+                        'progress': 93,
+                        'status': 'Downloading parser data...',
+                        'tiles_extracted': tiles_extracted,
+                        'packages_downloaded': downloaded_packages
+                    }
+                parser_ok = self._download_parser_data(region_id, log)
+            else:
+                if iso_code:
+                    log("[DOWNLOAD] Parser data for %s already present" % iso_code)
+                else:
+                    log("[DOWNLOAD] No ISO code for %s, skipping parser" % region_id)
+                parser_ok = True
+            
+            # Download geocoder files for offline address search
+            log("[DOWNLOAD] Now downloading geocoder...")
+            with self.lock:
+                self.downloads[region_id] = {
+                    'progress': 96,
+                    'status': 'Downloading geocoder...',
+                    'tiles_extracted': tiles_extracted,
+                    'packages_downloaded': downloaded_packages
+                }
+            
+            geocoder_ok = self._download_geocoder(region_id, log)
+            
+            log("[DOWNLOAD] SUCCESS! Region %s complete. Tiles: %d, Packages: %d, Geocoder: %s, Libpostal: %s, Parser: %s" % (
+                region_id, tiles_extracted, downloaded_packages, 
+                'OK' if geocoder_ok else 'SKIPPED',
+                'OK' if libpostal_ok else 'SKIPPED',
+                'OK' if parser_ok else 'SKIPPED'))
             
             with self.lock:
                 self.downloads[region_id] = {
@@ -2083,10 +2379,479 @@ with open(sys.argv[1], 'rb') as f_in:
                 os.rmdir(temp_dir)
             except:
                 pass
+    
+    def _decompress_bz2(self, input_path, output_path, log_func=None):
+        """Decompress a bz2 file. Uses bz2 module or bunzip2 as fallback."""
+        import subprocess
+        
+        def log(msg):
+            if log_func:
+                log_func(msg)
+        
+        # Try bz2 module first
+        try:
+            import bz2
+            with open(input_path, 'rb') as f_in:
+                compressed_data = f_in.read()
+                decompressed_data = bz2.decompress(compressed_data)
+                with open(output_path, 'wb') as f_out:
+                    f_out.write(decompressed_data)
+            return len(compressed_data), len(decompressed_data)
+        except ImportError:
+            pass
+        except Exception as e:
+            log("[BZ2] bz2 module failed: %s, trying bunzip2..." % e)
+        
+        # Fallback to bunzip2 command
+        try:
+            # bunzip2 -k keeps original, -c outputs to stdout
+            result = subprocess.run(
+                ['bunzip2', '-k', '-c', input_path],
+                stdout=open(output_path, 'wb'),
+                stderr=subprocess.PIPE
+            )
+            if result.returncode == 0:
+                comp_size = os.path.getsize(input_path)
+                decomp_size = os.path.getsize(output_path)
+                return comp_size, decomp_size
+            else:
+                raise Exception("bunzip2 failed: %s" % result.stderr.decode())
+        except FileNotFoundError:
+            # bunzip2 not found, try bzip2 -d
+            result = subprocess.run(
+                ['bzip2', '-d', '-k', '-c', input_path],
+                stdout=open(output_path, 'wb'),
+                stderr=subprocess.PIPE
+            )
+            if result.returncode == 0:
+                comp_size = os.path.getsize(input_path)
+                decomp_size = os.path.getsize(output_path)
+                return comp_size, decomp_size
+            else:
+                raise Exception("bzip2 -d failed: %s" % result.stderr.decode())
+
+    def _download_geocoder(self, region_id, log_func=None):
+        """Download geocoder-nlp files for a region.
+        
+        Downloads from: https://data.modrana.org/osm_scout_server/geocoder-nlp-39/geocoder-nlp/{region_id}/
+        Files: geonlp-primary_sqlite.bz2, geonlp-normalized_trie.bz2, geonlp-normalized-id_kch.bz2
+        """
+        import sys
+        
+        def log(msg):
+            if log_func:
+                log_func(msg)
+            else:
+                print(msg)
+                sys.stdout.flush()
+        
+        CHUNK_SIZE = 65536
+        
+        # Convert region_id to geocoder URL format
+        # region_id: "europe/austria" -> geocoder URL: "europe-austria"
+        geocoder_region = region_id.replace('/', '-')
+        geocoder_url = GEOCODER_NLP_BASE + "/" + geocoder_region + "/"
+        
+        log("[GEOCODER] Starting geocoder download for region: %s" % region_id)
+        log("[GEOCODER] URL: %s" % geocoder_url)
+        
+        # Create geocoder directory with region subfolder
+        # e.g. /home/user/MyDocs/Maps.OSM/geocoder-nlp/europe-austria/
+        geocoder_base = '/home/user/MyDocs/Maps.OSM/geocoder-nlp'
+        geocoder_dir = os.path.join(geocoder_base, geocoder_region)
+        if not os.path.exists(geocoder_dir):
+            os.makedirs(geocoder_dir)
+        
+        # Temp directory for downloads
+        temp_dir = "/home/user/MyDocs/.valhalla-tmp"
+        if not os.path.exists(temp_dir):
+            try:
+                os.makedirs(temp_dir)
+            except:
+                temp_dir = os.path.dirname(self.tiles_dir)
+        
+        downloaded_files = []
+        
+        for bz2_file in GEOCODER_FILES:
+            file_url = geocoder_url + bz2_file
+            temp_path = os.path.join(temp_dir, bz2_file)
+            
+            # Output filename (remove .bz2, fix naming)
+            out_name = bz2_file.replace('.bz2', '')
+            # geonlp-primary.sqlite.bz2 -> geonlp-primary.sqlite
+            out_path = os.path.join(geocoder_dir, out_name)
+            
+            log("[GEOCODER] Downloading %s..." % bz2_file)
+            
+            try:
+                req = Request(file_url)
+                req.add_header('User-Agent', 'ValhallaBikeRouter/3.0')
+                response = urlopen(req, timeout=300)
+                file_size = int(response.headers.get('Content-Length', 0))
+                log("[GEOCODER] File size: %.1f KB" % (file_size / 1024.0))
+                
+                # Download to temp file
+                downloaded = 0
+                with open(temp_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                
+                log("[GEOCODER] Downloaded %s (%.1f KB)" % (bz2_file, downloaded / 1024.0))
+                
+                # Decompress bz2
+                log("[GEOCODER] Decompressing to %s..." % out_name)
+                comp_size, decomp_size = self._decompress_bz2(temp_path, out_path, log)
+                
+                log("[GEOCODER] Decompressed %s (%.1f KB -> %.1f KB)" % (
+                    out_name, 
+                    comp_size / 1024.0,
+                    decomp_size / 1024.0
+                ))
+                
+                downloaded_files.append(out_name)
+                
+                # Clean up temp file
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                    
+            except Exception as e:
+                log("[GEOCODER] Error downloading %s: %s" % (bz2_file, e))
+                # Continue with other files - geocoder is optional
+                continue
+        
+        if downloaded_files:
+            log("[GEOCODER] SUCCESS! Downloaded %d geocoder files: %s" % (
+                len(downloaded_files), downloaded_files))
+            return True
+        else:
+            log("[GEOCODER] WARNING: No geocoder files downloaded (offline search unavailable)")
+            return False
+
+    def _check_libpostal_data(self):
+        """Check if libpostal data files are present."""
+        for subdir, filename in LIBPOSTAL_FILES:
+            filepath = os.path.join(LIBPOSTAL_DATA_DIR, subdir, filename)
+            if not os.path.exists(filepath):
+                return False
+        return True
+    
+    def _download_libpostal_data(self, log_func=None):
+        """Download global libpostal data files (once, shared by all regions).
+        
+        Downloads from: https://data.modrana.org/osm_scout_server/postal-global-2/postal/global-v1/
+        Files: address_dictionary.dat.bz2, language_classifier.dat.bz2, numex.dat.bz2, transliteration.dat.bz2
+        
+        Total size: ~35 MB compressed, ~103 MB uncompressed
+        """
+        import sys
+        
+        def log(msg):
+            if log_func:
+                log_func(msg)
+            else:
+                print(msg)
+                sys.stdout.flush()
+        
+        # Check if already downloaded
+        if self._check_libpostal_data():
+            log("[LIBPOSTAL] Data already present, skipping download")
+            return True
+        
+        log("[LIBPOSTAL] Downloading global libpostal data (~35 MB compressed)...")
+        log("[LIBPOSTAL] This enables smart address parsing (e.g. 'Hauptstr 5' -> street + house_number)")
+        
+        CHUNK_SIZE = 65536
+        
+        # Create directories
+        for subdir, filename in LIBPOSTAL_FILES:
+            subdir_path = os.path.join(LIBPOSTAL_DATA_DIR, subdir)
+            if not os.path.exists(subdir_path):
+                try:
+                    os.makedirs(subdir_path)
+                except Exception as e:
+                    log("[LIBPOSTAL] Error creating directory %s: %s" % (subdir_path, e))
+                    return False
+        
+        # Temp directory for downloads
+        temp_dir = "/home/user/MyDocs/.valhalla-tmp"
+        if not os.path.exists(temp_dir):
+            try:
+                os.makedirs(temp_dir)
+            except:
+                temp_dir = "/tmp"
+        
+        downloaded_count = 0
+        
+        for subdir, filename in LIBPOSTAL_FILES:
+            bz2_filename = filename + ".bz2"
+            file_url = LIBPOSTAL_BASE_URL + "/" + subdir + "/" + bz2_filename
+            temp_path = os.path.join(temp_dir, bz2_filename)
+            out_path = os.path.join(LIBPOSTAL_DATA_DIR, subdir, filename)
+            
+            # Skip if already exists
+            if os.path.exists(out_path):
+                log("[LIBPOSTAL] %s already exists, skipping" % filename)
+                downloaded_count += 1
+                continue
+            
+            log("[LIBPOSTAL] Downloading %s..." % bz2_filename)
+            
+            try:
+                req = Request(file_url)
+                req.add_header('User-Agent', 'ValhallaBikeRouter/3.0')
+                response = urlopen(req, timeout=600)  # 10 min timeout for large files
+                file_size = int(response.headers.get('Content-Length', 0))
+                log("[LIBPOSTAL] File size: %.1f MB" % (file_size / (1024.0 * 1024.0)))
+                
+                # Download to temp file
+                downloaded = 0
+                with open(temp_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        # Progress every 5 MB
+                        if downloaded % (5 * 1024 * 1024) < CHUNK_SIZE:
+                            log("[LIBPOSTAL] Downloaded %.1f MB..." % (downloaded / (1024.0 * 1024.0)))
+                
+                log("[LIBPOSTAL] Downloaded %s (%.1f MB)" % (bz2_filename, downloaded / (1024.0 * 1024.0)))
+                
+                # Decompress bz2
+                log("[LIBPOSTAL] Decompressing %s..." % filename)
+                comp_size, decomp_size = self._decompress_bz2(temp_path, out_path, log)
+                
+                log("[LIBPOSTAL] Decompressed %s (%.1f MB -> %.1f MB)" % (
+                    filename, 
+                    comp_size / (1024.0 * 1024.0),
+                    decomp_size / (1024.0 * 1024.0)
+                ))
+                
+                downloaded_count += 1
+                
+                # Clean up temp file
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                    
+            except Exception as e:
+                log("[LIBPOSTAL] Error downloading %s: %s" % (bz2_filename, e))
+                # Continue with other files
+                continue
+        
+        if downloaded_count == len(LIBPOSTAL_FILES):
+            log("[LIBPOSTAL] SUCCESS! All libpostal data files downloaded")
+            return True
+        elif downloaded_count > 0:
+            log("[LIBPOSTAL] WARNING: Only %d/%d libpostal files downloaded" % (
+                downloaded_count, len(LIBPOSTAL_FILES)))
+            return True  # Partial success - some parsing may work
+        else:
+            log("[LIBPOSTAL] WARNING: No libpostal files downloaded (using primitive parser)")
+            return False
+
+    def _get_iso_code(self, region_id):
+        """Get ISO country code for a region_id."""
+        # Direct lookup
+        if region_id in REGION_TO_ISO:
+            return REGION_TO_ISO[region_id]
+        
+        # Try to extract from region name (e.g., 'europe/austria' -> look for 'austria')
+        region_name = region_id.split('/')[-1].lower()
+        
+        # Common mappings for region names
+        name_to_iso = {
+            'austria': 'AT', 'hungary': 'HU', 'germany': 'DE', 'switzerland': 'CH',
+            'czech-republic': 'CZ', 'slovakia': 'SK', 'poland': 'PL', 'italy': 'IT',
+            'france': 'FR', 'spain': 'ES', 'portugal': 'PT', 'netherlands': 'NL',
+            'belgium': 'BE', 'united-kingdom': 'GB', 'great-britain': 'GB',
+            'sweden': 'SE', 'norway': 'NO', 'finland': 'FI', 'denmark': 'DK',
+            'greece': 'GR', 'croatia': 'HR', 'slovenia': 'SI', 'serbia': 'RS',
+            'romania': 'RO', 'bulgaria': 'BG', 'ukraine': 'UA', 'russia': 'RU',
+            'liechtenstein': 'LI', 'luxembourg': 'LU', 'azores': 'PT',
+            'usa': 'US', 'canada': 'CA', 'japan': 'JP', 'china': 'CN',
+            'india': 'IN', 'australia': 'AU', 'new-zealand': 'NZ',
+            'ireland': 'GB-IE', 'cyprus': 'CY', 'malta': 'MT', 'iceland': 'IS',
+            'estonia': 'EE', 'latvia': 'LV', 'lithuania': 'LT',
+            'bosnia-herzegovina': 'BA', 'albania': 'AL', 'montenegro': 'ME',
+            'macedonia': 'MK', 'kosovo': 'RS', 'moldova': 'MD', 'belarus': 'BY',
+        }
+        
+        return name_to_iso.get(region_name)
+
+    def _check_parser_data(self, iso_code):
+        """Check if parser data exists for an ISO country code."""
+        parser_dir = os.path.join(LIBPOSTAL_PARSER_DIR, iso_code, 'address_parser')
+        if not os.path.exists(parser_dir):
+            return False
+        
+        for filename in LIBPOSTAL_PARSER_FILES:
+            if not os.path.exists(os.path.join(parser_dir, filename)):
+                return False
+        return True
+
+    def _download_parser_data(self, region_id, log_func=None):
+        """Download country-specific libpostal parser data.
+        
+        Downloads from: https://data.modrana.org/osm_scout_server/postal-country-2/postal/countries-v1/{ISO}/address_parser/
+        """
+        import sys
+        
+        def log(msg):
+            if log_func:
+                log_func(msg)
+            else:
+                print(msg)
+                sys.stdout.flush()
+        
+        iso_code = self._get_iso_code(region_id)
+        if not iso_code:
+            log("[PARSER] Unknown region %s, cannot determine ISO code" % region_id)
+            return False
+        
+        log("[PARSER] ISO code for %s is %s" % (region_id, iso_code))
+        
+        # Check if already downloaded
+        if self._check_parser_data(iso_code):
+            log("[PARSER] Parser data for %s already present" % iso_code)
+            return True
+        
+        log("[PARSER] Downloading parser data for %s (~2 MB compressed)..." % iso_code)
+        
+        CHUNK_SIZE = 65536
+        
+        # Create directory
+        parser_dir = os.path.join(LIBPOSTAL_PARSER_DIR, iso_code, 'address_parser')
+        if not os.path.exists(parser_dir):
+            try:
+                os.makedirs(parser_dir)
+            except Exception as e:
+                log("[PARSER] Error creating directory %s: %s" % (parser_dir, e))
+                return False
+        
+        # Temp directory
+        temp_dir = "/home/user/MyDocs/.valhalla-tmp"
+        if not os.path.exists(temp_dir):
+            try:
+                os.makedirs(temp_dir)
+            except:
+                temp_dir = "/tmp"
+        
+        downloaded_count = 0
+        
+        for filename in LIBPOSTAL_PARSER_FILES:
+            bz2_filename = filename + ".bz2"
+            file_url = LIBPOSTAL_PARSER_BASE_URL + "/" + iso_code + "/address_parser/" + bz2_filename
+            temp_path = os.path.join(temp_dir, bz2_filename)
+            out_path = os.path.join(parser_dir, filename)
+            
+            # Skip if already exists
+            if os.path.exists(out_path):
+                log("[PARSER] %s already exists, skipping" % filename)
+                downloaded_count += 1
+                continue
+            
+            log("[PARSER] Downloading %s..." % bz2_filename)
+            
+            try:
+                req = Request(file_url)
+                req.add_header('User-Agent', 'ValhallaBikeRouter/3.0')
+                response = urlopen(req, timeout=300)
+                file_size = int(response.headers.get('Content-Length', 0))
+                log("[PARSER] File size: %.1f KB" % (file_size / 1024.0))
+                
+                # Download
+                downloaded = 0
+                with open(temp_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                
+                log("[PARSER] Downloaded %s (%.1f KB)" % (bz2_filename, downloaded / 1024.0))
+                
+                # Decompress
+                log("[PARSER] Decompressing %s..." % filename)
+                comp_size, decomp_size = self._decompress_bz2(temp_path, out_path, log)
+                
+                log("[PARSER] Decompressed %s (%.1f KB -> %.1f KB)" % (
+                    filename,
+                    comp_size / 1024.0,
+                    decomp_size / 1024.0
+                ))
+                
+                downloaded_count += 1
+                
+                # Clean up
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                    
+            except Exception as e:
+                log("[PARSER] Error downloading %s: %s" % (bz2_filename, e))
+                continue
+        
+        if downloaded_count == len(LIBPOSTAL_PARSER_FILES):
+            log("[PARSER] SUCCESS! All parser files for %s downloaded" % iso_code)
+            return True
+        elif downloaded_count > 0:
+            log("[PARSER] WARNING: Only %d/%d parser files downloaded" % (
+                downloaded_count, len(LIBPOSTAL_PARSER_FILES)))
+            return True
+        else:
+            log("[PARSER] WARNING: No parser files downloaded for %s" % iso_code)
+            return False
 
 
 # Global download manager
 download_manager = None
+
+# Global geocoder instance (cached for speed)
+_geocoder_instance = None
+_geocoder_initialized = False
+
+def get_cached_geocoder(warmup=False):
+    """Get or create cached offline geocoder instance.
+    
+    If warmup=True, also initialize libpostal (takes ~5s first time).
+    """
+    global _geocoder_instance, _geocoder_initialized
+    
+    if _geocoder_instance is None:
+        try:
+            from geocoder_offline import OfflineGeocoder
+            _geocoder_instance = OfflineGeocoder()
+            print("[SERVER] Created cached geocoder instance", file=sys.stderr)
+        except ImportError as e:
+            print("[SERVER] Could not import geocoder_offline: %s" % e, file=sys.stderr)
+            return None
+        except Exception as e:
+            print("[SERVER] Error creating geocoder: %s" % e, file=sys.stderr)
+            return None
+    
+    # Warm up libpostal if requested (first search will be fast)
+    if warmup and not _geocoder_initialized and _geocoder_instance is not None:
+        print("[SERVER] Warming up libpostal (this takes ~5 seconds)...", file=sys.stderr)
+        try:
+            # Do a dummy search to trigger libpostal initialization
+            _geocoder_instance.search("test", limit=1)
+            _geocoder_initialized = True
+            print("[SERVER] libpostal ready!", file=sys.stderr)
+        except Exception as e:
+            print("[SERVER] libpostal warmup failed: %s" % e, file=sys.stderr)
+    
+    return _geocoder_instance
 
 
 class ValhallaHandler(BaseHTTPRequestHandler):
@@ -2110,8 +2875,12 @@ class ValhallaHandler(BaseHTTPRequestHandler):
             self.handle_tiles()
         elif path.startswith('/download/'):
             self.handle_download(path)
+        elif path.startswith('/update/'):
+            self.handle_update(path)
         elif path == '/download_status':
             self.handle_download_status()
+        elif path == '/geocode':
+            self.handle_geocode(parsed.query)
         else:
             self.send_error(404)
     
@@ -2213,6 +2982,69 @@ class ValhallaHandler(BaseHTTPRequestHandler):
             status = {}
         self.send_json({'downloads': status})
     
+    def handle_update(self, path):
+        """Update/repair an installed region - download missing geocoder/libpostal files"""
+        global download_manager
+        # path is like /update/europe/liechtenstein
+        region_id = path[len('/update/'):]
+        print("[SERVER] handle_update: region_id = %s" % region_id)
+        
+        if not download_manager:
+            download_manager = DownloadManager(self.tiles_dir)
+        
+        result = download_manager.update_region(region_id)
+        self.send_json(result)
+    
+    def handle_geocode(self, query_string):
+        """Offline geocoding with cached libpostal - much faster than CLI"""
+        try:
+            # Parse query params
+            params = {}
+            if query_string:
+                try:
+                    from urllib.parse import parse_qs
+                except ImportError:
+                    from urlparse import parse_qs
+                params = parse_qs(query_string)
+            
+            query = params.get('q', [''])[0]
+            limit = int(params.get('limit', ['10'])[0])
+            
+            if not query:
+                self.send_json({'success': False, 'error': 'Missing q parameter'})
+                return
+            
+            print("[SERVER] Geocode query: %s" % query, file=sys.stderr)
+            
+            # Get cached geocoder
+            geocoder = get_cached_geocoder()
+            if geocoder is None:
+                self.send_json({'success': False, 'error': 'Geocoder not available', 'locations': []})
+                return
+            
+            # Search
+            results = geocoder.search(query, limit=limit)
+            
+            # Format results for API compatibility
+            locations = []
+            for r in results:
+                locations.append({
+                    'name': r.get('display_name', r.get('name', 'Unknown')),
+                    'lat': r.get('lat'),
+                    'lng': r.get('lon') or r.get('lng'),
+                    'type': r.get('type', ''),
+                    'source': 'offline'
+                })
+            
+            print("[SERVER] Geocode returned %d results" % len(locations), file=sys.stderr)
+            self.send_json({'success': True, 'locations': locations, 'source': 'offline'})
+            
+        except Exception as e:
+            import traceback
+            print("[SERVER] Geocode error: %s" % e, file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            self.send_json({'success': False, 'error': str(e), 'locations': []})
+    
     def handle_route(self):
         try:
             length = int(self.headers.get('Content-Length', 0))
@@ -2249,9 +3081,16 @@ class ValhallaHandler(BaseHTTPRequestHandler):
                 result = subprocess.run(
                     [c_router_path, self.tiles_dir, 
                      str(from_lat), str(from_lon), str(to_lat), str(to_lon)],
-                    capture_output=True, timeout=120
+                    capture_output=True  # No timeout - let it run as long as needed
                 )
                 elapsed = time_module.time() - t0
+                
+                # Always print C router stderr for debugging
+                c_stderr = result.stderr.decode('utf-8', errors='replace').strip()
+                if c_stderr:
+                    for line in c_stderr.split('\n')[:30]:  # First 30 lines
+                        print("[C-ROUTER] %s" % line)
+                
                 if result.returncode == 0:
                     c_result = json.loads(result.stdout.decode('utf-8'))
                     if 'coords' in c_result and c_result['coords']:
@@ -2288,6 +3127,10 @@ class ValhallaHandler(BaseHTTPRequestHandler):
                             }
                         })
                         return
+                    else:
+                        print("[ROUTE] C router returned no coords: %s" % result.stdout.decode('utf-8')[:200])
+                else:
+                    print("[ROUTE] C router exit code %d" % result.returncode)
                 print("[ROUTE] C router failed, falling back to Python")
             except Exception as e:
                 print("[ROUTE] C router error: %s, falling back to Python" % e)
@@ -2373,6 +3216,20 @@ def run_server(tiles_dir=None, port=SERVER_PORT):
     print("")
     print("API: POST /v2/route (Valhalla-compatible)")
     print("=" * 50)
+    
+    # Start libpostal warmup in background thread
+    # Takes several minutes on N9, but search works with primitive parser meanwhile
+    import threading
+    def warmup_geocoder():
+        try:
+            from geocoder_offline import warmup_libpostal
+            warmup_libpostal()
+        except Exception as e:
+            print("[SERVER] libpostal warmup error: %s" % e, file=sys.stderr)
+    
+    warmup_thread = threading.Thread(target=warmup_geocoder, daemon=True)
+    warmup_thread.start()
+    print("[SERVER] libpostal loading in background (search uses fast mode until ready)")
     
     server = HTTPServer(('127.0.0.1', port), ValhallaHandler)
     

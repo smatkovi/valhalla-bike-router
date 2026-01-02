@@ -64,7 +64,7 @@ PageStackWindow {
     ]
     
     Component.onCompleted: {
-        console.log("=== Bike Router 3.0.26 Starting ===")
+        console.log("=== Bike Router 3.0.53 Starting ===")
         networkHelper.locationsReady.connect(onLocationsReady)
         networkHelper.routeReady.connect(onRouteReady)
         networkHelper.routeFileWritten.connect(onRouteFileWritten)
@@ -1463,7 +1463,7 @@ PageStackWindow {
                         spacing: 4
                         
                         Text {
-                            text: "Bike Router v3.0.26"
+                            text: "Bike Router v3.0.53"
                             font.pixelSize: 16
                             font.bold: true
                             color: textColor
@@ -1572,6 +1572,33 @@ PageStackWindow {
         } catch (e) {
             console.log("JSON parse error: " + e)
             banner.text = "Error: " + e + " - Result: " + result.substring(0, 100)
+            banner.show()
+        }
+    }
+    
+    function startUpdate(regionId) {
+        console.log("startUpdate called with: " + regionId)
+        banner.text = "Checking updates: " + regionId
+        banner.show()
+        
+        var result = networkHelper.runCommand("update " + regionId)
+        console.log("Update command result: " + result)
+        
+        try {
+            var data = JSON.parse(result)
+            console.log("Parsed data success: " + data.success + " error: " + data.error)
+            if (data.success) {
+                downloadStatus[regionId] = {progress: 0, status: 'checking'}
+                checkDownloadTimer.start()
+                banner.text = "Update started for " + regionId
+                banner.show()
+            } else {
+                banner.text = "Error: " + (data.error || "Unknown")
+                banner.show()
+            }
+        } catch (e) {
+            console.log("JSON parse error: " + e)
+            banner.text = "Error: " + e
             banner.show()
         }
     }
@@ -1871,6 +1898,47 @@ PageStackWindow {
                                 color: "#4CAF50"
                                 visible: modelData && modelData.is_installed
                                 anchors.verticalCenter: parent.verticalCenter
+                            }
+                            
+                            // Update button (for installed regions - downloads missing geocoder/libpostal)
+                            Rectangle {
+                                width: modelData && modelData.is_installed ? 50 : 0
+                                height: 36
+                                radius: 4
+                                visible: modelData && modelData.is_installed
+                                color: {
+                                    if (!modelData || !modelData.id) return "#2196F3"
+                                    var dl = downloadStatus[modelData.id]
+                                    if (dl && dl.status === 'complete') return "#4CAF50"
+                                    if (dl && (dl.progress > 0 || dl.status === 'checking')) return "#FFC107"
+                                    return "#2196F3"
+                                }
+                                anchors.verticalCenter: parent.verticalCenter
+                                
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: {
+                                        if (!modelData || !modelData.id) return "UPD"
+                                        var dl = downloadStatus[modelData.id]
+                                        if (dl && dl.status === 'complete') return "✓"
+                                        if (dl && dl.progress > 0) return dl.progress + "%"
+                                        if (dl && dl.status === 'checking') return "..."
+                                        return "UPD"
+                                    }
+                                    font.pixelSize: 12
+                                    color: "white"
+                                }
+                                
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        if (!modelData || !modelData.id) return
+                                        var dl = downloadStatus[modelData.id]
+                                        if (!dl || dl.status === 'complete' || dl.status === 'error' || dl.status === 'idle' || !dl.status) {
+                                            startUpdate(modelData.id)
+                                        }
+                                    }
+                                }
                             }
                             
                             // Download button (if downloadable and not installed)
