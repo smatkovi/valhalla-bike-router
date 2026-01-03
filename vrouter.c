@@ -72,7 +72,6 @@ typedef struct {
     uint8_t has_bike;      /* Forward bicycle access */
     uint8_t has_bike_rev;  /* Reverse bicycle access */
     uint8_t has_ped;       /* Forward pedestrian access (for pushing bike) */
-    uint8_t has_car;       /* Car access (for avoid_cars option) */
     uint8_t opp_index;
     uint32_t edgeinfo_offset;
 } EdgeEnd;
@@ -148,16 +147,6 @@ static int g_visited_capacity = 0;
 
 static State g_path[MAX_PATH];
 static int g_path_len = 0;
-
-/* Routing options */
-static int g_avoid_pushing = 0;  /* If 1, avoid pedestrian-only sections */
-static int g_avoid_cars = 0;     /* If 1, prefer roads without car traffic */
-
-/* Statistics for route segments - 3 levels of car exposure */
-static float g_dist_car_free = 0;     /* No cars at all (paths, cycleways away from roads) */
-static float g_dist_separated = 0;    /* Separated bike lane next to car road (can hear traffic) */
-static float g_dist_with_cars = 0;    /* Shared road with cars */
-static float g_dist_pushing = 0;      /* Distance where bike must be pushed */
 
 /* ============================================================================
  * Utility Functions
@@ -400,7 +389,6 @@ static Tile* load_tile(int level, uint32_t tile_id) {
         t->edge_ends[i].has_bike = ((fwd_access | rev_access) & kBicycleAccess) ? 1 : 0;
         t->edge_ends[i].has_bike_rev = (rev_access & kBicycleAccess) ? 1 : 0;
         t->edge_ends[i].has_ped = ((fwd_access | rev_access) & kPedestrianAccess) ? 1 : 0;
-        t->edge_ends[i].has_car = ((fwd_access | rev_access) & kCarAccess) ? 1 : 0;
     }
     
     return t;
@@ -840,22 +828,12 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
             /* Base cost: length / speed */
             float cost = ed.length / 15.0 * 3.6;  /* ~15 km/h cycling */
             
-            /* Track what type of segment this is */
-            int is_pushing = 0;
-            int is_with_cars = ee->has_car;
-            
             /* Access-based cost multiplier */
             if (ee->has_bike) {
                 /* Normal cycling - no penalty */
             } else if (ee->has_ped) {
                 /* Walking/pushing bike - 3x slower */
-                is_pushing = 1;
-                if (g_avoid_pushing) {
-                    /* User wants to avoid pushing - very high penalty */
-                    cost *= 20.0;
-                } else {
-                    cost *= 3.0;
-                }
+                cost *= 3.0;
             } else {
                 /* No official access - very high penalty but still possible */
                 cost *= 10.0;
@@ -864,12 +842,6 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
             /* Road type penalties */
             if (ed.classification <= 2) cost *= 1.5;  /* Major roads */
             if (ed.cycle_lane > 0) cost *= 0.8;       /* Cycle lanes preferred */
-            
-            /* Avoid cars penalty */
-            if (g_avoid_cars && ee->has_car) {
-                /* User wants to avoid roads with car traffic */
-                cost *= 2.0;
-            }
             
             float new_g = cur.g + cost;
             float new_dist = cur.dist + ed.length;
@@ -931,8 +903,8 @@ static int route(double from_lat, double from_lon, double to_lat, double to_lon)
  * ============================================================================ */
 
 int main(int argc, char **argv) {
-    if (argc < 6) {
-        fprintf(stderr, "Usage: %s <tiles_dir> <from_lat> <from_lon> <to_lat> <to_lon> [avoid_pushing] [avoid_cars]\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <tiles_dir> <from_lat> <from_lon> <to_lat> <to_lon>\n", argv[0]);
         return 1;
     }
     
@@ -941,12 +913,6 @@ int main(int argc, char **argv) {
     double from_lon = atof(argv[3]);
     double to_lat = atof(argv[4]);
     double to_lon = atof(argv[5]);
-    
-    /* Optional parameters */
-    if (argc > 6) g_avoid_pushing = atoi(argv[6]);
-    if (argc > 7) g_avoid_cars = atoi(argv[7]);
-    
-    fprintf(stderr, "[ROUTE] Options: avoid_pushing=%d, avoid_cars=%d\n", g_avoid_pushing, g_avoid_cars);
     
     visited_init();
     
@@ -959,72 +925,22 @@ int main(int argc, char **argv) {
     printf("{\"coords\":[");
     double total_dist = 0;
     double prev_lat = 0, prev_lon = 0;
-    
-    /* Reset statistics */
-    g_dist_car_free = 0;
-    g_dist_separated = 0;
-    g_dist_with_cars = 0;
-    g_dist_pushing = 0;
-    
     for (int i = 0; i < g_path_len; i++) {
         Tile *t = find_tile(g_path[i].level, g_path[i].tile_id);
         if (t && g_path[i].node_id < t->node_count) {
             Node *n = &t->nodes[g_path[i].node_id];
             if (i > 0) {
                 printf(",");
-                double seg_dist = haversine(prev_lat, prev_lon, n->lat, n->lon);
-                total_dist += seg_dist;
-                
-                /* Find edge from previous node to current node to get access info */
-                State prev_state = g_path[i-1];
-                Tile *prev_tile = find_tile(prev_state.level, prev_state.tile_id);
-                if (prev_tile && prev_state.node_id < prev_tile->node_count) {
-                    Node *prev_node = &prev_tile->nodes[prev_state.node_id];
-                    /* Find the edge that connects to current node */
-                    for (uint32_t ei = prev_node->edge_index; 
-                         ei < prev_node->edge_index + prev_node->edge_count && ei < prev_tile->edge_count; ei++) {
-                        EdgeEnd *ee = &prev_tile->edge_ends[ei];
-                        if (ee->end_level == g_path[i].level && 
-                            ee->end_tile_id == g_path[i].tile_id && 
-                            ee->end_node_id == g_path[i].node_id) {
-                            /* Found the edge - get details for cycle_lane */
-                            EdgeDetails ed;
-                            get_edge_details(prev_tile, ei, &ed);
-                            
-                            if (!ee->has_bike && ee->has_ped) {
-                                /* Pedestrian only - pushing */
-                                g_dist_pushing += seg_dist;
-                            } else if (!ee->has_car) {
-                                /* No car access at all - completely car free */
-                                g_dist_car_free += seg_dist;
-                            } else if (ed.cycle_lane >= 2) {
-                                /* Has car access but dedicated/separated bike lane */
-                                /* cycle_lane: 2=dedicated lane, 3=separated path */
-                                g_dist_separated += seg_dist;
-                            } else {
-                                /* Shared road with cars */
-                                g_dist_with_cars += seg_dist;
-                            }
-                            break;
-                        }
-                    }
-                }
+                total_dist += haversine(prev_lat, prev_lon, n->lat, n->lon);
             }
             printf("{\"lat\":%.7f,\"lon\":%.7f}", n->lat, n->lon);
             prev_lat = n->lat;
             prev_lon = n->lon;
         }
     }
-    printf("],\"nodes\":%d,\"total_dist_km\":%.2f", g_path_len, total_dist / 1000.0);
-    printf(",\"dist_car_free_km\":%.2f", g_dist_car_free / 1000.0);
-    printf(",\"dist_separated_km\":%.2f", g_dist_separated / 1000.0);
-    printf(",\"dist_with_cars_km\":%.2f", g_dist_with_cars / 1000.0);
-    printf(",\"dist_pushing_km\":%.2f}\n", g_dist_pushing / 1000.0);
+    printf("],\"nodes\":%d,\"total_dist_km\":%.2f}\n", g_path_len, total_dist / 1000.0);
     
     fprintf(stderr, "[DEBUG] Output path: %d nodes, %.2f km total\n", g_path_len, total_dist / 1000.0);
-    fprintf(stderr, "[DEBUG] Stats: car_free=%.2fkm, separated=%.2fkm, with_cars=%.2fkm, pushing=%.2fkm\n",
-            g_dist_car_free / 1000.0, g_dist_separated / 1000.0, 
-            g_dist_with_cars / 1000.0, g_dist_pushing / 1000.0);
     
     return 0;
 }
