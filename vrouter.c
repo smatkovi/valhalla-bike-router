@@ -555,13 +555,39 @@ static float edge_cost(EdgeEnd *ee, EdgeDetails *ed) {
 static uint32_t find_nearest_node(Tile *t, double lat, double lon) {
     uint32_t best = 0;
     double best_dist = 1e18;
+    uint32_t best_bike = 0;
+    double best_bike_dist = 1e18;
+    
     for (uint32_t i = 0; i < t->node_count; i++) {
         if (t->nodes[i].edge_count == 0) continue;
         double d = haversine(lat, lon, t->nodes[i].lat, t->nodes[i].lon);
+        
+        /* Check if node has bike-accessible edges */
+        int has_bike_edge = 0;
+        for (uint32_t ei = t->nodes[i].edge_index; 
+             ei < t->nodes[i].edge_index + t->nodes[i].edge_count && ei < t->edge_count; 
+             ei++) {
+            EdgeEnd ee;
+            if (!get_edge_end(t, ei, &ee)) continue;
+            if (ee.has_bike || ee.has_ped) {
+                has_bike_edge = 1;
+                break;
+            }
+        }
+        
+        if (has_bike_edge && d < best_bike_dist) {
+            best_bike_dist = d;
+            best_bike = i;
+        }
         if (d < best_dist) {
             best_dist = d;
             best = i;
         }
+    }
+    
+    /* Prefer bike-accessible node if within 500m */
+    if (best_bike_dist < 500.0 || best_bike_dist < best_dist * 2) {
+        return best_bike;
     }
     return best;
 }
@@ -587,7 +613,12 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     g_dist_pushing = 0;
     
     Tile *start_tile = load_tile(start_tile_id);
-    if (!start_tile || start_node >= start_tile->node_count) return 0;
+    if (!start_tile || start_node >= start_tile->node_count) {
+        fprintf(stderr, "[ERROR] Invalid start: tile=%p node=%u/%u\n",
+                (void*)start_tile, start_node, 
+                start_tile ? start_tile->node_count : 0);
+        return 0;
+    }
     
     Node *sn = &start_tile->nodes[start_node];
     
@@ -602,12 +633,67 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     heap_push(init);
     visited_insert(start, 0, null_state, 0);
     
+    /* Debug: check start node edges */
+    {
+        int bike_edges = 0, ped_edges = 0, car_edges = 0, total_edges = 0;
+        Node *snode = &start_tile->nodes[start_node];
+        fprintf(stderr, "[DEBUG] Start node %u: edge_index=%u edge_count=%u\n",
+                start_node, snode->edge_index, snode->edge_count);
+        for (uint32_t ei = snode->edge_index; 
+             ei < snode->edge_index + snode->edge_count && ei < start_tile->edge_count; 
+             ei++) {
+            EdgeEnd ee;
+            if (!get_edge_end(start_tile, ei, &ee)) continue;
+            total_edges++;
+            if (ee.has_bike) bike_edges++;
+            if (ee.has_ped) ped_edges++;
+            if (ee.has_car) car_edges++;
+        }
+        fprintf(stderr, "[DEBUG] Start edges: total=%d bike=%d ped=%d car=%d\n",
+                total_edges, bike_edges, ped_edges, car_edges);
+    }
+    
+    /* Debug: check end node edges */
+    {
+        Tile *etile = load_tile(end_tile_id);
+        if (etile && end_node < etile->node_count) {
+            int bike_edges = 0, ped_edges = 0, car_edges = 0, total_edges = 0;
+            Node *enode = &etile->nodes[end_node];
+            fprintf(stderr, "[DEBUG] End node %u: edge_index=%u edge_count=%u\n",
+                    end_node, enode->edge_index, enode->edge_count);
+            for (uint32_t ei = enode->edge_index; 
+                 ei < enode->edge_index + enode->edge_count && ei < etile->edge_count; 
+                 ei++) {
+                EdgeEnd ee;
+                if (!get_edge_end(etile, ei, &ee)) continue;
+                total_edges++;
+                if (ee.has_bike) bike_edges++;
+                if (ee.has_ped) ped_edges++;
+                if (ee.has_car) car_edges++;
+            }
+            fprintf(stderr, "[DEBUG] End edges: total=%d bike=%d ped=%d car=%d\n",
+                    total_edges, bike_edges, ped_edges, car_edges);
+        }
+    }
+    
     int iterations = 0;
-    int max_iterations = 500000;
+    int max_iterations = 2000000;  /* 2 million for dense urban areas */
     
     while (g_heap_size > 0 && iterations < max_iterations) {
         HeapEntry cur = heap_pop();
         iterations++;
+        
+        /* Progress debug every 100000 iterations */
+        if (iterations % 100000 == 0) {
+            Tile *cur_tile = load_tile(cur.state.tile_id);
+            double dist_to_goal = 999999;
+            if (cur_tile && cur.state.node_id < cur_tile->node_count) {
+                Node *cn = &cur_tile->nodes[cur.state.node_id];
+                dist_to_goal = haversine(cn->lat, cn->lon, end_lat, end_lon);
+            }
+            fprintf(stderr, "[DEBUG] Iter %d: heap=%d tiles=%d dist_to_goal=%.1fm\n", 
+                    iterations, g_heap_size, g_tile_count, dist_to_goal);
+        }
         
         /* Goal check */
         if (cur.state.tile_id == end_state.tile_id && 
@@ -703,14 +789,35 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
             if (!get_edge_end(tile, ei, &ee)) continue;
             
             /* Filters */
-            if (ee.end_level != 2) continue;
-            if (!ee.has_bike && !ee.has_ped) continue;
+            if (ee.end_level != 2) {
+                static int level_filtered = 0;
+                if (++level_filtered <= 3) {
+                    fprintf(stderr, "[DEBUG] Level filter: end_level=%d (need 2)\n", ee.end_level);
+                }
+                continue;
+            }
+            if (!ee.has_bike && !ee.has_ped) {
+                static int access_filtered = 0;
+                if (++access_filtered <= 3) {
+                    fprintf(stderr, "[DEBUG] Access filter: has_bike=%d has_ped=%d\n", 
+                            ee.has_bike, ee.has_ped);
+                }
+                continue;
+            }
             
             EdgeDetails ed;
             if (!get_edge_details(tile, ei, &ed)) continue;
             
             /* Surface check */
-            if (ed.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+            if (ed.surface > kWorstAllowedSurface[g_bicycle_type]) {
+                /* Debug: count filtered edges */
+                static int surface_filtered = 0;
+                if (++surface_filtered <= 5) {
+                    fprintf(stderr, "[DEBUG] Surface filter: edge surface=%d > allowed=%d\n",
+                            ed.surface, kWorstAllowedSurface[g_bicycle_type]);
+                }
+                continue;
+            }
             
             /* Calculate cost (includes stress factor for avoid_cars) */
             float cost = edge_cost(&ee, &ed);
@@ -740,6 +847,8 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
         }
     }
     
+    fprintf(stderr, "[DEBUG] No path after %d iterations (heap_size=%d)\n", 
+            iterations, g_heap_size);
     return 0;
 }
 
@@ -793,18 +902,30 @@ int main(int argc, char *argv[]) {
     int to_col = (int)((to_lon + 180.0) / LEVEL_2_SIZE);
     uint32_t to_tile_id = to_row * 1440 + to_col;
     
+    fprintf(stderr, "[DEBUG] from_tile=%u to_tile=%u\n", from_tile_id, to_tile_id);
+    
     /* Load tiles and find nodes */
     Tile *from_tile = load_tile(from_tile_id);
     Tile *to_tile = load_tile(to_tile_id);
     
     if (!from_tile || !to_tile) {
-        fprintf(stderr, "Failed to load tiles\n");
+        fprintf(stderr, "[ERROR] Failed to load tiles (from=%p to=%p)\n", 
+                (void*)from_tile, (void*)to_tile);
         printf("{\"error\": \"tile_load_failed\"}\n");
         return 1;
     }
     
+    fprintf(stderr, "[DEBUG] from_tile: nodes=%u edges=%u\n", 
+            from_tile->node_count, from_tile->edge_count);
+    fprintf(stderr, "[DEBUG] to_tile: nodes=%u edges=%u\n", 
+            to_tile->node_count, to_tile->edge_count);
+    
     uint32_t start_node = find_nearest_node(from_tile, from_lat, from_lon);
     uint32_t end_node = find_nearest_node(to_tile, to_lat, to_lon);
+    
+    fprintf(stderr, "[DEBUG] start_node=%u end_node=%u\n", start_node, end_node);
+    fprintf(stderr, "[DEBUG] Distance: %.1f km\n", 
+            haversine(from_lat, from_lon, to_lat, to_lon) / 1000.0);
     
     /* Route */
     int path_len = route(from_tile_id, start_node, to_tile_id, end_node, to_lat, to_lon);
