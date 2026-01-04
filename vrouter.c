@@ -40,8 +40,8 @@
 #define kTruckAccess 8
 #define kCarAccess 1  /* Same as kAutoAccess */
 
-/* Limits - increased for reliability */
-#define MAX_TILES 50
+/* Limits - increased for long routes */
+#define MAX_TILES 200
 #define MAX_HEAP 1000000
 #define MAX_VISITED 2000003  /* Large prime number */
 #define MAX_PATH 200000
@@ -107,10 +107,15 @@ static char g_tiles_dir[512];
 static Tile g_tiles[MAX_TILES];
 static int g_tile_count = 0;
 
-static HeapEntry *g_heap = NULL;
-static int g_heap_size = 0;
+/* Forward search (from start) */
+static HeapEntry *g_heap_fwd = NULL;
+static int g_heap_fwd_size = 0;
+static VisitedEntry *g_visited_fwd = NULL;
 
-static VisitedEntry *g_visited = NULL;
+/* Backward search (from goal) */
+static HeapEntry *g_heap_bwd = NULL;
+static int g_heap_bwd_size = 0;
+static VisitedEntry *g_visited_bwd = NULL;
 
 static State *g_path = NULL;
 static int g_path_len = 0;
@@ -231,7 +236,17 @@ static Tile* load_tile(uint32_t tile_id) {
         if (g_tiles[i].tile_id == tile_id) return &g_tiles[i];
     }
     
-    if (g_tile_count >= MAX_TILES) return NULL;
+    /* If cache full, evict oldest tile (simple FIFO) */
+    if (g_tile_count >= MAX_TILES) {
+        /* Free the first (oldest) tile */
+        free(g_tiles[0].raw_data);
+        free(g_tiles[0].nodes);
+        /* Shift all tiles down */
+        for (int i = 0; i < g_tile_count - 1; i++) {
+            g_tiles[i] = g_tiles[i + 1];
+        }
+        g_tile_count--;
+    }
     
     char path[1024];
     snprintf(path, sizeof(path), "%s/2/%03d/%03d/%03d.gph.gz",
@@ -331,46 +346,80 @@ static int get_edge_details(Tile *t, uint32_t idx, EdgeDetails *ed) {
 }
 
 /* ============================================================================
- * Heap Operations
+ * Heap Operations (bidirectional)
  * ============================================================================ */
 
-static void heap_push(HeapEntry e) {
-    if (g_heap_size >= MAX_HEAP) return;
-    int i = g_heap_size++;
-    g_heap[i] = e;
+/* Forward heap functions */
+static void heap_push_fwd(HeapEntry e) {
+    if (g_heap_fwd_size >= MAX_HEAP) return;
+    int i = g_heap_fwd_size++;
+    g_heap_fwd[i] = e;
     while (i > 0) {
         int p = (i - 1) / 2;
-        if (g_heap[p].f <= g_heap[i].f) break;
-        HeapEntry tmp = g_heap[p];
-        g_heap[p] = g_heap[i];
-        g_heap[i] = tmp;
+        if (g_heap_fwd[p].f <= g_heap_fwd[i].f) break;
+        HeapEntry tmp = g_heap_fwd[p];
+        g_heap_fwd[p] = g_heap_fwd[i];
+        g_heap_fwd[i] = tmp;
         i = p;
     }
 }
 
-static HeapEntry heap_pop(void) {
-    HeapEntry ret = g_heap[0];
-    g_heap[0] = g_heap[--g_heap_size];
+static HeapEntry heap_pop_fwd(void) {
+    HeapEntry ret = g_heap_fwd[0];
+    g_heap_fwd[0] = g_heap_fwd[--g_heap_fwd_size];
     int i = 0;
     while (1) {
         int l = 2*i + 1, r = 2*i + 2, smallest = i;
-        if (l < g_heap_size && g_heap[l].f < g_heap[smallest].f) smallest = l;
-        if (r < g_heap_size && g_heap[r].f < g_heap[smallest].f) smallest = r;
+        if (l < g_heap_fwd_size && g_heap_fwd[l].f < g_heap_fwd[smallest].f) smallest = l;
+        if (r < g_heap_fwd_size && g_heap_fwd[r].f < g_heap_fwd[smallest].f) smallest = r;
         if (smallest == i) break;
-        HeapEntry tmp = g_heap[i];
-        g_heap[i] = g_heap[smallest];
-        g_heap[smallest] = tmp;
+        HeapEntry tmp = g_heap_fwd[i];
+        g_heap_fwd[i] = g_heap_fwd[smallest];
+        g_heap_fwd[smallest] = tmp;
+        i = smallest;
+    }
+    return ret;
+}
+
+/* Backward heap functions */
+static void heap_push_bwd(HeapEntry e) {
+    if (g_heap_bwd_size >= MAX_HEAP) return;
+    int i = g_heap_bwd_size++;
+    g_heap_bwd[i] = e;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (g_heap_bwd[p].f <= g_heap_bwd[i].f) break;
+        HeapEntry tmp = g_heap_bwd[p];
+        g_heap_bwd[p] = g_heap_bwd[i];
+        g_heap_bwd[i] = tmp;
+        i = p;
+    }
+}
+
+static HeapEntry heap_pop_bwd(void) {
+    HeapEntry ret = g_heap_bwd[0];
+    g_heap_bwd[0] = g_heap_bwd[--g_heap_bwd_size];
+    int i = 0;
+    while (1) {
+        int l = 2*i + 1, r = 2*i + 2, smallest = i;
+        if (l < g_heap_bwd_size && g_heap_bwd[l].f < g_heap_bwd[smallest].f) smallest = l;
+        if (r < g_heap_bwd_size && g_heap_bwd[r].f < g_heap_bwd[smallest].f) smallest = r;
+        if (smallest == i) break;
+        HeapEntry tmp = g_heap_bwd[i];
+        g_heap_bwd[i] = g_heap_bwd[smallest];
+        g_heap_bwd[smallest] = tmp;
         i = smallest;
     }
     return ret;
 }
 
 /* ============================================================================
- * Visited Set - Improved Hash Table
+ * Visited Set - Improved Hash Table (two sets for bidirectional search)
  * ============================================================================ */
 
-static void visited_clear(void) {
-    memset(g_visited, 0, MAX_VISITED * sizeof(VisitedEntry));
+static void visited_clear_both(void) {
+    memset(g_visited_fwd, 0, MAX_VISITED * sizeof(VisitedEntry));
+    memset(g_visited_bwd, 0, MAX_VISITED * sizeof(VisitedEntry));
 }
 
 static inline uint32_t hash_state(State s) {
@@ -383,31 +432,63 @@ static inline uint32_t hash_state(State s) {
     return (uint32_t)(h % MAX_VISITED);
 }
 
-static VisitedEntry* visited_find(State s) {
+/* Forward visited functions */
+static VisitedEntry* visited_find_fwd(State s) {
     uint32_t h = hash_state(s);
     for (int i = 0; i < 2000; i++) {
         uint32_t idx = (h + i) % MAX_VISITED;
-        if (!g_visited[idx].valid) return NULL;
-        if (g_visited[idx].state.tile_id == s.tile_id && 
-            g_visited[idx].state.node_id == s.node_id) {
-            return &g_visited[idx];
+        if (!g_visited_fwd[idx].valid) return NULL;
+        if (g_visited_fwd[idx].state.tile_id == s.tile_id && 
+            g_visited_fwd[idx].state.node_id == s.node_id) {
+            return &g_visited_fwd[idx];
         }
     }
     return NULL;
 }
 
-static void visited_insert(State s, float g, State parent, uint32_t parent_edge) {
+static void visited_insert_fwd(State s, float g, State parent, uint32_t parent_edge) {
     uint32_t h = hash_state(s);
     for (int i = 0; i < 2000; i++) {
         uint32_t idx = (h + i) % MAX_VISITED;
-        if (!g_visited[idx].valid || 
-            (g_visited[idx].state.tile_id == s.tile_id && 
-             g_visited[idx].state.node_id == s.node_id)) {
-            g_visited[idx].state = s;
-            g_visited[idx].g = g;
-            g_visited[idx].parent = parent;
-            g_visited[idx].parent_edge = parent_edge;
-            g_visited[idx].valid = 1;
+        if (!g_visited_fwd[idx].valid || 
+            (g_visited_fwd[idx].state.tile_id == s.tile_id && 
+             g_visited_fwd[idx].state.node_id == s.node_id)) {
+            g_visited_fwd[idx].state = s;
+            g_visited_fwd[idx].g = g;
+            g_visited_fwd[idx].parent = parent;
+            g_visited_fwd[idx].parent_edge = parent_edge;
+            g_visited_fwd[idx].valid = 1;
+            return;
+        }
+    }
+}
+
+/* Backward visited functions */
+static VisitedEntry* visited_find_bwd(State s) {
+    uint32_t h = hash_state(s);
+    for (int i = 0; i < 2000; i++) {
+        uint32_t idx = (h + i) % MAX_VISITED;
+        if (!g_visited_bwd[idx].valid) return NULL;
+        if (g_visited_bwd[idx].state.tile_id == s.tile_id && 
+            g_visited_bwd[idx].state.node_id == s.node_id) {
+            return &g_visited_bwd[idx];
+        }
+    }
+    return NULL;
+}
+
+static void visited_insert_bwd(State s, float g, State parent, uint32_t parent_edge) {
+    uint32_t h = hash_state(s);
+    for (int i = 0; i < 2000; i++) {
+        uint32_t idx = (h + i) % MAX_VISITED;
+        if (!g_visited_bwd[idx].valid || 
+            (g_visited_bwd[idx].state.tile_id == s.tile_id && 
+             g_visited_bwd[idx].state.node_id == s.node_id)) {
+            g_visited_bwd[idx].state = s;
+            g_visited_bwd[idx].g = g;
+            g_visited_bwd[idx].parent = parent;
+            g_visited_bwd[idx].parent_edge = parent_edge;
+            g_visited_bwd[idx].valid = 1;
             return;
         }
     }
@@ -593,8 +674,56 @@ static uint32_t find_nearest_node(Tile *t, double lat, double lon) {
 }
 
 /* ============================================================================
- * Main Routing Function
+ * Main Routing Function - BIDIRECTIONAL A* SEARCH
  * ============================================================================ */
+
+static void calculate_statistics(void) {
+    /* Calculate statistics for the final path */
+    for (int i = 0; i < g_path_len - 1; i++) {
+        State s = g_path[i];
+        State next = g_path[i + 1];
+        
+        Tile *t = load_tile(s.tile_id);
+        if (!t || s.node_id >= t->node_count) continue;
+        
+        Node *n = &t->nodes[s.node_id];
+        
+        /* Find edge from s to next */
+        for (uint32_t ei = n->edge_index; 
+             ei < n->edge_index + n->edge_count && ei < t->edge_count; 
+             ei++) {
+            EdgeEnd ee;
+            if (!get_edge_end(t, ei, &ee)) continue;
+            
+            if (ee.end_tile_id == next.tile_id && ee.end_node_id == next.node_id) {
+                EdgeDetails ed;
+                if (!get_edge_details(t, ei, &ed)) break;
+                
+                int is_path = (ed.use == USE_CYCLEWAY || ed.use == USE_PATH || 
+                               ed.use == USE_FOOTWAY || ed.use == USE_MOUNTAIN_BIKE);
+                
+                int is_low_traffic = (ed.use == USE_TRACK || 
+                                      ed.use == USE_LIVING_STREET ||
+                                      ed.use == USE_SERVICE_ROAD);
+                
+                if (!ee.has_bike && ee.has_ped) {
+                    g_dist_pushing += ed.length;
+                } else if (is_path && !ee.has_car) {
+                    g_dist_car_free += ed.length;
+                } else if (is_low_traffic) {
+                    g_dist_car_free += ed.length;
+                } else if (ed.cycle_lane >= 2) {
+                    g_dist_separated += ed.length;
+                } else if (ee.has_car) {
+                    g_dist_with_cars += ed.length;
+                } else {
+                    g_dist_car_free += ed.length;
+                }
+                break;
+            }
+        }
+    }
+}
 
 static int route(uint32_t start_tile_id, uint32_t start_node,
                  uint32_t end_tile_id, uint32_t end_node,
@@ -602,8 +731,9 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     
     init_costing();
     
-    g_heap_size = 0;
-    visited_clear();
+    g_heap_fwd_size = 0;
+    g_heap_bwd_size = 0;
+    visited_clear_both();
     g_path_len = 0;
     
     /* Reset statistics */
@@ -612,244 +742,266 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     g_dist_with_cars = 0;
     g_dist_pushing = 0;
     
+    /* Load start and end tiles */
     Tile *start_tile = load_tile(start_tile_id);
+    Tile *end_tile = load_tile(end_tile_id);
+    
     if (!start_tile || start_node >= start_tile->node_count) {
-        fprintf(stderr, "[ERROR] Invalid start: tile=%p node=%u/%u\n",
-                (void*)start_tile, start_node, 
-                start_tile ? start_tile->node_count : 0);
+        fprintf(stderr, "[ERROR] Invalid start\n");
+        return 0;
+    }
+    if (!end_tile || end_node >= end_tile->node_count) {
+        fprintf(stderr, "[ERROR] Invalid end\n");
         return 0;
     }
     
     Node *sn = &start_tile->nodes[start_node];
+    Node *en = &end_tile->nodes[end_node];
+    double start_lat = sn->lat, start_lon = sn->lon;
     
+    /* Calculate initial distance */
+    double init_dist = haversine(start_lat, start_lon, end_lat, end_lon);
     float max_speed = 2.0f * kDefaultCyclingSpeed[g_bicycle_type];
-    float h0 = haversine(sn->lat, sn->lon, end_lat, end_lon) * kSpeedFactor[(int)max_speed];
     
-    State start = { start_tile_id, start_node };
+    State start_state = { start_tile_id, start_node };
     State end_state = { end_tile_id, end_node };
     State null_state = { 0, 0 };
     
-    HeapEntry init = { h0, 0, 0, start, null_state, 0 };
-    heap_push(init);
-    visited_insert(start, 0, null_state, 0);
+    /* Initialize forward search (from start) */
+    float h_fwd = init_dist * kSpeedFactor[(int)max_speed];
+    HeapEntry init_fwd = { h_fwd, 0, 0, start_state, null_state, 0 };
+    heap_push_fwd(init_fwd);
+    visited_insert_fwd(start_state, 0, null_state, 0);
     
-    /* Debug: check start node edges */
-    {
-        int bike_edges = 0, ped_edges = 0, car_edges = 0, total_edges = 0;
-        Node *snode = &start_tile->nodes[start_node];
-        fprintf(stderr, "[DEBUG] Start node %u: edge_index=%u edge_count=%u\n",
-                start_node, snode->edge_index, snode->edge_count);
-        for (uint32_t ei = snode->edge_index; 
-             ei < snode->edge_index + snode->edge_count && ei < start_tile->edge_count; 
-             ei++) {
-            EdgeEnd ee;
-            if (!get_edge_end(start_tile, ei, &ee)) continue;
-            total_edges++;
-            if (ee.has_bike) bike_edges++;
-            if (ee.has_ped) ped_edges++;
-            if (ee.has_car) car_edges++;
-        }
-        fprintf(stderr, "[DEBUG] Start edges: total=%d bike=%d ped=%d car=%d\n",
-                total_edges, bike_edges, ped_edges, car_edges);
-    }
-    
-    /* Debug: check end node edges */
-    {
-        Tile *etile = load_tile(end_tile_id);
-        if (etile && end_node < etile->node_count) {
-            int bike_edges = 0, ped_edges = 0, car_edges = 0, total_edges = 0;
-            Node *enode = &etile->nodes[end_node];
-            fprintf(stderr, "[DEBUG] End node %u: edge_index=%u edge_count=%u\n",
-                    end_node, enode->edge_index, enode->edge_count);
-            for (uint32_t ei = enode->edge_index; 
-                 ei < enode->edge_index + enode->edge_count && ei < etile->edge_count; 
-                 ei++) {
-                EdgeEnd ee;
-                if (!get_edge_end(etile, ei, &ee)) continue;
-                total_edges++;
-                if (ee.has_bike) bike_edges++;
-                if (ee.has_ped) ped_edges++;
-                if (ee.has_car) car_edges++;
-            }
-            fprintf(stderr, "[DEBUG] End edges: total=%d bike=%d ped=%d car=%d\n",
-                    total_edges, bike_edges, ped_edges, car_edges);
-        }
-    }
+    /* Initialize backward search (from end) */
+    float h_bwd = init_dist * kSpeedFactor[(int)max_speed];
+    HeapEntry init_bwd = { h_bwd, 0, 0, end_state, null_state, 0 };
+    heap_push_bwd(init_bwd);
+    visited_insert_bwd(end_state, 0, null_state, 0);
     
     int iterations = 0;
-    int max_iterations = 2000000;  /* 2 million for dense urban areas */
+    int max_iterations = (int)(init_dist / 1000.0 * 30000);  /* Less iterations needed with bidirectional */
+    if (max_iterations < 1000000) max_iterations = 1000000;
+    if (max_iterations > 6000000) max_iterations = 6000000;
     
-    while (g_heap_size > 0 && iterations < max_iterations) {
-        HeapEntry cur = heap_pop();
-        iterations++;
+    fprintf(stderr, "[ROUTE-BIDIR] Distance: %.1f km, max_iterations: %d\n", 
+            init_dist / 1000.0, max_iterations);
+    
+    State meeting_point = { 0, 0 };
+    float best_total_cost = 1e18f;
+    
+    while ((g_heap_fwd_size > 0 || g_heap_bwd_size > 0) && iterations < max_iterations) {
         
-        /* Progress debug every 100000 iterations */
-        if (iterations % 100000 == 0) {
-            Tile *cur_tile = load_tile(cur.state.tile_id);
-            double dist_to_goal = 999999;
-            if (cur_tile && cur.state.node_id < cur_tile->node_count) {
-                Node *cn = &cur_tile->nodes[cur.state.node_id];
-                dist_to_goal = haversine(cn->lat, cn->lon, end_lat, end_lon);
+        /* === FORWARD EXPANSION === */
+        if (g_heap_fwd_size > 0) {
+            HeapEntry cur = heap_pop_fwd();
+            iterations++;
+            
+            VisitedEntry *ve = visited_find_fwd(cur.state);
+            if (ve && cur.g > ve->g) goto do_backward;
+            
+            /* Check if this node was visited by backward search */
+            VisitedEntry *bwd_ve = visited_find_bwd(cur.state);
+            if (bwd_ve) {
+                float total = cur.g + bwd_ve->g;
+                if (total < best_total_cost) {
+                    best_total_cost = total;
+                    meeting_point = cur.state;
+                    fprintf(stderr, "[ROUTE-BIDIR] Meeting point found at iter %d, cost=%.1f\n",
+                            iterations, total);
+                }
             }
-            fprintf(stderr, "[DEBUG] Iter %d: heap=%d tiles=%d dist_to_goal=%.1fm\n", 
-                    iterations, g_heap_size, g_tile_count, dist_to_goal);
+            
+            Tile *tile = load_tile(cur.state.tile_id);
+            if (!tile || cur.state.node_id >= tile->node_count) goto do_backward;
+            
+            Node *node = &tile->nodes[cur.state.node_id];
+            
+            /* Expand forward edges */
+            for (uint32_t ei = node->edge_index; 
+                 ei < node->edge_index + node->edge_count && ei < tile->edge_count; 
+                 ei++) {
+                
+                EdgeEnd ee;
+                if (!get_edge_end(tile, ei, &ee)) continue;
+                if (ee.end_level != 2) continue;
+                if (!ee.has_bike && !ee.has_ped) continue;
+                
+                EdgeDetails ed;
+                if (!get_edge_details(tile, ei, &ed)) continue;
+                if (ed.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                
+                float cost = edge_cost(&ee, &ed);
+                if (!ee.has_bike && ee.has_ped) {
+                    cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                }
+                
+                float new_g = cur.g + cost;
+                State ns = { ee.end_tile_id, ee.end_node_id };
+                
+                VisitedEntry *nve = visited_find_fwd(ns);
+                if (nve && new_g >= nve->g) continue;
+                
+                Tile *ntile = load_tile(ns.tile_id);
+                if (!ntile || ns.node_id >= ntile->node_count) continue;
+                
+                Node *nn = &ntile->nodes[ns.node_id];
+                float h = haversine(nn->lat, nn->lon, end_lat, end_lon) * kSpeedFactor[(int)max_speed];
+                
+                HeapEntry ne = { new_g + h, new_g, cur.dist + ed.length, ns, cur.state, ei };
+                heap_push_fwd(ne);
+                visited_insert_fwd(ns, new_g, cur.state, ei);
+            }
         }
         
-        /* Goal check */
-        if (cur.state.tile_id == end_state.tile_id && 
-            cur.state.node_id == end_state.node_id) {
+do_backward:
+        /* === BACKWARD EXPANSION === */
+        if (g_heap_bwd_size > 0) {
+            HeapEntry cur = heap_pop_bwd();
+            iterations++;
             
-            /* Reconstruct path */
-            State s = end_state;
-            while (s.tile_id != 0 || s.node_id != 0) {
-                if (g_path_len >= MAX_PATH) break;
-                g_path[g_path_len++] = s;
-                VisitedEntry *ve = visited_find(s);
-                if (!ve) break;
-                if (ve->parent.tile_id == 0 && ve->parent.node_id == 0) {
-                    /* Check if this is actually the start */
-                    if (s.tile_id == start.tile_id && s.node_id == start.node_id) break;
-                }
-                s = ve->parent;
-            }
+            VisitedEntry *ve = visited_find_bwd(cur.state);
+            if (ve && cur.g > ve->g) continue;
             
-            /* Reverse path */
-            for (int i = 0; i < g_path_len / 2; i++) {
-                State tmp = g_path[i];
-                g_path[i] = g_path[g_path_len - 1 - i];
-                g_path[g_path_len - 1 - i] = tmp;
-            }
-            
-            /* Calculate statistics for the final path only */
-            for (int i = 0; i < g_path_len - 1; i++) {
-                State s = g_path[i];
-                State next = g_path[i + 1];
-                
-                Tile *t = load_tile(s.tile_id);
-                if (!t || s.node_id >= t->node_count) continue;
-                
-                Node *n = &t->nodes[s.node_id];
-                
-                /* Find edge from s to next */
-                for (uint32_t ei = n->edge_index; 
-                     ei < n->edge_index + n->edge_count && ei < t->edge_count; 
-                     ei++) {
-                    EdgeEnd ee;
-                    if (!get_edge_end(t, ei, &ee)) continue;
-                    
-                    if (ee.end_tile_id == next.tile_id && ee.end_node_id == next.node_id) {
-                        EdgeDetails ed;
-                        if (!get_edge_details(t, ei, &ed)) break;
-                        
-                        int is_path = (ed.use == USE_CYCLEWAY || ed.use == USE_PATH || 
-                                       ed.use == USE_FOOTWAY || ed.use == USE_MOUNTAIN_BIKE);
-                        
-                        /* Track/Feldwege = praktisch autofrei */
-                        int is_low_traffic = (ed.use == USE_TRACK || 
-                                              ed.use == USE_LIVING_STREET ||
-                                              ed.use == USE_SERVICE_ROAD);
-                        
-                        if (!ee.has_bike && ee.has_ped) {
-                            g_dist_pushing += ed.length;
-                        } else if (is_path && !ee.has_car) {
-                            g_dist_car_free += ed.length;
-                        } else if (is_low_traffic) {
-                            g_dist_car_free += ed.length;  /* Feldwege = car_free */
-                        } else if (ed.cycle_lane >= 2) {
-                            g_dist_separated += ed.length;
-                        } else if (ee.has_car) {
-                            g_dist_with_cars += ed.length;
-                        } else {
-                            g_dist_car_free += ed.length;
-                        }
-                        break;
-                    }
+            /* Check if this node was visited by forward search */
+            VisitedEntry *fwd_ve = visited_find_fwd(cur.state);
+            if (fwd_ve) {
+                float total = cur.g + fwd_ve->g;
+                if (total < best_total_cost) {
+                    best_total_cost = total;
+                    meeting_point = cur.state;
+                    fprintf(stderr, "[ROUTE-BIDIR] Meeting point found at iter %d, cost=%.1f\n",
+                            iterations, total);
                 }
             }
             
-            return g_path_len;
+            Tile *tile = load_tile(cur.state.tile_id);
+            if (!tile || cur.state.node_id >= tile->node_count) continue;
+            
+            Node *node = &tile->nodes[cur.state.node_id];
+            
+            /* Expand backward edges (same as forward - roads are bidirectional for bikes) */
+            for (uint32_t ei = node->edge_index; 
+                 ei < node->edge_index + node->edge_count && ei < tile->edge_count; 
+                 ei++) {
+                
+                EdgeEnd ee;
+                if (!get_edge_end(tile, ei, &ee)) continue;
+                if (ee.end_level != 2) continue;
+                if (!ee.has_bike && !ee.has_ped) continue;
+                
+                EdgeDetails ed;
+                if (!get_edge_details(tile, ei, &ed)) continue;
+                if (ed.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                
+                float cost = edge_cost(&ee, &ed);
+                if (!ee.has_bike && ee.has_ped) {
+                    cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                }
+                
+                float new_g = cur.g + cost;
+                State ns = { ee.end_tile_id, ee.end_node_id };
+                
+                VisitedEntry *nve = visited_find_bwd(ns);
+                if (nve && new_g >= nve->g) continue;
+                
+                Tile *ntile = load_tile(ns.tile_id);
+                if (!ntile || ns.node_id >= ntile->node_count) continue;
+                
+                Node *nn = &ntile->nodes[ns.node_id];
+                float h = haversine(nn->lat, nn->lon, start_lat, start_lon) * kSpeedFactor[(int)max_speed];
+                
+                HeapEntry ne = { new_g + h, new_g, cur.dist + ed.length, ns, cur.state, ei };
+                heap_push_bwd(ne);
+                visited_insert_bwd(ns, new_g, cur.state, ei);
+            }
         }
         
-        /* Skip if already visited with better cost */
-        VisitedEntry *ve = visited_find(cur.state);
-        if (ve && cur.g > ve->g) continue;
+        /* Progress debug */
+        if (iterations % 500000 == 0) {
+            fprintf(stderr, "[ROUTE-BIDIR] Iter %d: fwd_heap=%d bwd_heap=%d tiles=%d\n", 
+                    iterations, g_heap_fwd_size, g_heap_bwd_size, g_tile_count);
+        }
         
-        /* Get current tile and node */
-        Tile *tile = load_tile(cur.state.tile_id);
-        if (!tile || cur.state.node_id >= tile->node_count) continue;
-        
-        Node *node = &tile->nodes[cur.state.node_id];
-        
-        /* Expand edges */
-        for (uint32_t ei = node->edge_index; 
-             ei < node->edge_index + node->edge_count && ei < tile->edge_count; 
-             ei++) {
-            
-            EdgeEnd ee;
-            if (!get_edge_end(tile, ei, &ee)) continue;
-            
-            /* Filters */
-            if (ee.end_level != 2) {
-                static int level_filtered = 0;
-                if (++level_filtered <= 3) {
-                    fprintf(stderr, "[DEBUG] Level filter: end_level=%d (need 2)\n", ee.end_level);
-                }
-                continue;
+        /* Early termination if we found a path and both heaps' minimum f-values exceed best */
+        if (meeting_point.tile_id != 0) {
+            float min_fwd = (g_heap_fwd_size > 0) ? g_heap_fwd[0].f : 1e18f;
+            float min_bwd = (g_heap_bwd_size > 0) ? g_heap_bwd[0].f : 1e18f;
+            if (min_fwd + min_bwd >= best_total_cost) {
+                fprintf(stderr, "[ROUTE-BIDIR] Early termination: optimal path found\n");
+                break;
             }
-            if (!ee.has_bike && !ee.has_ped) {
-                static int access_filtered = 0;
-                if (++access_filtered <= 3) {
-                    fprintf(stderr, "[DEBUG] Access filter: has_bike=%d has_ped=%d\n", 
-                            ee.has_bike, ee.has_ped);
-                }
-                continue;
-            }
-            
-            EdgeDetails ed;
-            if (!get_edge_details(tile, ei, &ed)) continue;
-            
-            /* Surface check */
-            if (ed.surface > kWorstAllowedSurface[g_bicycle_type]) {
-                /* Debug: count filtered edges */
-                static int surface_filtered = 0;
-                if (++surface_filtered <= 5) {
-                    fprintf(stderr, "[DEBUG] Surface filter: edge surface=%d > allowed=%d\n",
-                            ed.surface, kWorstAllowedSurface[g_bicycle_type]);
-                }
-                continue;
-            }
-            
-            /* Calculate cost (includes stress factor for avoid_cars) */
-            float cost = edge_cost(&ee, &ed);
-            
-            /* Penalty for pedestrian-only (pushing) */
-            if (!ee.has_bike && ee.has_ped) {
-                cost *= g_avoid_pushing ? 5.0f : 2.0f;
-            }
-            
-            float new_g = cur.g + cost;
-            State ns = { ee.end_tile_id, ee.end_node_id };
-            
-            /* Skip if already visited with better cost */
-            VisitedEntry *nve = visited_find(ns);
-            if (nve && new_g >= nve->g) continue;
-            
-            /* Load target tile for heuristic */
-            Tile *ntile = load_tile(ns.tile_id);
-            if (!ntile || ns.node_id >= ntile->node_count) continue;
-            
-            Node *nn = &ntile->nodes[ns.node_id];
-            float h = haversine(nn->lat, nn->lon, end_lat, end_lon) * kSpeedFactor[(int)max_speed];
-            
-            HeapEntry ne = { new_g + h, new_g, cur.dist + ed.length, ns, cur.state, ei };
-            heap_push(ne);
-            visited_insert(ns, new_g, cur.state, ei);
         }
     }
     
-    fprintf(stderr, "[DEBUG] No path after %d iterations (heap_size=%d)\n", 
-            iterations, g_heap_size);
-    return 0;
+    /* Reconstruct path if meeting point found */
+    if (meeting_point.tile_id == 0) {
+        fprintf(stderr, "[ROUTE-BIDIR] No path found (iterations=%d, tiles=%d)\n", 
+                iterations, g_tile_count);
+        return 0;
+    }
+    
+    fprintf(stderr, "[ROUTE-BIDIR] Reconstructing path...\n");
+    
+    /* Build forward path: start -> meeting_point */
+    State *fwd_path = malloc(MAX_PATH * sizeof(State));
+    int fwd_len = 0;
+    
+    State s = meeting_point;
+    while (s.tile_id != 0 || s.node_id != 0) {
+        if (fwd_len >= MAX_PATH) break;
+        fwd_path[fwd_len++] = s;
+        VisitedEntry *ve = visited_find_fwd(s);
+        if (!ve) break;
+        if (ve->parent.tile_id == 0 && ve->parent.node_id == 0) {
+            if (s.tile_id == start_state.tile_id && s.node_id == start_state.node_id) break;
+        }
+        s = ve->parent;
+    }
+    
+    /* Reverse forward path (was meeting->start, need start->meeting) */
+    for (int i = 0; i < fwd_len / 2; i++) {
+        State tmp = fwd_path[i];
+        fwd_path[i] = fwd_path[fwd_len - 1 - i];
+        fwd_path[fwd_len - 1 - i] = tmp;
+    }
+    
+    /* Build backward path: meeting_point -> end (already in correct order from parent links) */
+    State *bwd_path = malloc(MAX_PATH * sizeof(State));
+    int bwd_len = 0;
+    
+    s = meeting_point;
+    VisitedEntry *ve = visited_find_bwd(s);
+    if (ve) s = ve->parent;  /* Skip meeting point (already in fwd_path) */
+    
+    while (s.tile_id != 0 || s.node_id != 0) {
+        if (bwd_len >= MAX_PATH) break;
+        bwd_path[bwd_len++] = s;
+        ve = visited_find_bwd(s);
+        if (!ve) break;
+        if (ve->parent.tile_id == 0 && ve->parent.node_id == 0) {
+            if (s.tile_id == end_state.tile_id && s.node_id == end_state.node_id) break;
+        }
+        s = ve->parent;
+    }
+    
+    /* Combine paths: fwd_path + bwd_path */
+    g_path_len = 0;
+    for (int i = 0; i < fwd_len && g_path_len < MAX_PATH; i++) {
+        g_path[g_path_len++] = fwd_path[i];
+    }
+    for (int i = 0; i < bwd_len && g_path_len < MAX_PATH; i++) {
+        g_path[g_path_len++] = bwd_path[i];
+    }
+    
+    free(fwd_path);
+    free(bwd_path);
+    
+    fprintf(stderr, "[ROUTE-BIDIR] Path length: %d nodes\n", g_path_len);
+    
+    calculate_statistics();
+    
+    return g_path_len;
 }
 
 /* ============================================================================
@@ -883,12 +1035,14 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[ROUTE] Options: avoid_pushing=%d, avoid_cars=%d, use_roads=%.2f, bike=%s\n",
             g_avoid_pushing, g_avoid_cars, g_use_roads, bike_names[g_bicycle_type]);
     
-    /* Allocate memory */
-    g_heap = malloc(MAX_HEAP * sizeof(HeapEntry));
-    g_visited = malloc(MAX_VISITED * sizeof(VisitedEntry));
+    /* Allocate memory for bidirectional search */
+    g_heap_fwd = malloc(MAX_HEAP * sizeof(HeapEntry));
+    g_heap_bwd = malloc(MAX_HEAP * sizeof(HeapEntry));
+    g_visited_fwd = malloc(MAX_VISITED * sizeof(VisitedEntry));
+    g_visited_bwd = malloc(MAX_VISITED * sizeof(VisitedEntry));
     g_path = malloc(MAX_PATH * sizeof(State));
     
-    if (!g_heap || !g_visited || !g_path) {
+    if (!g_heap_fwd || !g_heap_bwd || !g_visited_fwd || !g_visited_bwd || !g_path) {
         fprintf(stderr, "Memory allocation failed\n");
         return 1;
     }
@@ -915,17 +1069,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    fprintf(stderr, "[DEBUG] from_tile: nodes=%u edges=%u\n", 
-            from_tile->node_count, from_tile->edge_count);
-    fprintf(stderr, "[DEBUG] to_tile: nodes=%u edges=%u\n", 
-            to_tile->node_count, to_tile->edge_count);
-    
     uint32_t start_node = find_nearest_node(from_tile, from_lat, from_lon);
     uint32_t end_node = find_nearest_node(to_tile, to_lat, to_lon);
     
     fprintf(stderr, "[DEBUG] start_node=%u end_node=%u\n", start_node, end_node);
-    fprintf(stderr, "[DEBUG] Distance: %.1f km\n", 
-            haversine(from_lat, from_lon, to_lat, to_lon) / 1000.0);
     
     /* Route */
     int path_len = route(from_tile_id, start_node, to_tile_id, end_node, to_lat, to_lon);
@@ -956,8 +1103,10 @@ int main(int argc, char *argv[]) {
         free(g_tiles[i].raw_data);
         free(g_tiles[i].nodes);
     }
-    free(g_heap);
-    free(g_visited);
+    free(g_heap_fwd);
+    free(g_heap_bwd);
+    free(g_visited_fwd);
+    free(g_visited_bwd);
     free(g_path);
     
     return 0;
