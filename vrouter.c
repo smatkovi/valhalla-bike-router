@@ -179,6 +179,7 @@ typedef struct {
     uint8_t use, classification, cycle_lane, surface;
     uint8_t speed, bike_network, lanecount, use_sidepath;
     uint8_t dismount, shoulder, weighted_grade;
+    uint8_t sac_scale;
 } Edge;
 
 typedef struct { 
@@ -248,9 +249,11 @@ static float g_use_hills = 0.25f;
 static int g_bicycle_type = 3;
 static int g_avoid_pushing = 0;
 static int g_avoid_cars = 0;
+static int g_routing_mode = 0;  /* 0=bicycle, 1=pedestrian (alpine) */
 
 static float g_dist_car_free = 0, g_dist_separated = 0;
 static float g_dist_with_cars = 0, g_dist_pushing = 0;
+static float g_dist_steps = 0;  /* for pedestrian stats */
 
 /* ============================================================================
  * Bicycle Costing Constants (from Valhalla bicyclecost.cc)
@@ -487,6 +490,7 @@ static inline int get_edge(Tile *t, uint32_t idx, Edge *e) {
     e->use_sidepath = (w3 >> 40) & 0x1;
     e->dismount = (w3 >> 41) & 0x1;
     e->shoulder = (w3 >> 44) & 0x1;
+    e->sac_scale = (w3 >> 34) & 0x7;
     
     e->length = (float)((w4 >> 32) & 0xFFFFFF);
     e->weighted_grade = (w4 >> 56) & 0xF;
@@ -801,6 +805,53 @@ static float edge_cost(Edge *e) {
     return time_cost * preference;
 }
 
+/* Pedestrian costing: alpine mode — shortest route, all ways allowed.
+ * Simple time-based cost at ~5 km/h base speed with grade/sac_scale
+ * adjustments for realistic walking times. No preference penalties. */
+static const float kWalkingSpeed = 5.0f;  /* km/h base */
+
+/* SAC scale speed factors: T1=easy..T6=difficult alpine.
+ * These slow you down but never block. Index 0 = no tag (normal path). */
+static const float kSacScaleSpeedFactor[8] = {
+    1.0f,   /* 0: kNone - normal path */
+    1.0f,   /* 1: T1 hiking - easy trail */
+    0.85f,  /* 2: T2 mountain hiking */
+    0.70f,  /* 3: T3 demanding mountain hiking */
+    0.55f,  /* 4: T4 alpine hiking */
+    0.40f,  /* 5: T5 demanding alpine hiking */
+    0.30f,  /* 6: T6 difficult alpine hiking */
+    0.30f   /* 7: reserved */
+};
+
+/* Grade-based walking speed factor (Tobler's hiking function simplified).
+ * Index 7 = flat. Lower = uphill, higher = downhill. */
+static const float kPedGradeSpeedFactor[16] = {
+    1.4f, 1.3f, 1.2f, 1.1f, 1.05f, 1.0f, 1.0f, 1.0f,
+    0.95f, 0.85f, 0.75f, 0.60f, 0.50f, 0.40f, 0.35f, 0.30f
+};
+
+static float pedestrian_cost(Edge *e) {
+    if (e->length <= 0) return 1e9f;
+    
+    int grade = e->weighted_grade; if (grade > 15) grade = 15;
+    int sac = e->sac_scale; if (sac > 7) sac = 7;
+    
+    float speed = kWalkingSpeed 
+                  * kPedGradeSpeedFactor[grade]
+                  * kSacScaleSpeedFactor[sac];
+    
+    /* Steps: slower but always walkable */
+    if (e->use == USE_STEPS) speed *= 0.6f;
+    /* Ferry: use ferry speed */
+    if (e->use == USE_FERRY) return e->length * kSpeedFactor[e->speed] * 1.1f;
+    
+    if (speed < 1.5f) speed = 1.5f;  /* minimum 1.5 km/h even on T6 */
+    if (speed > 6.0f) speed = 6.0f;
+    
+    /* Pure time cost — no preference penalties for shortest route */
+    return e->length / (speed / 3.6f);
+}
+
 /* ============================================================================
  * Find Nearest Node - NEON batch distance
  * ============================================================================ */
@@ -849,7 +900,11 @@ static uint32_t find_nearest_node(Tile *t, float lat, float lon) {
                  ei++) {
                 Edge edge;
                 if (!get_edge(t, ei, &edge)) continue;
-                if (edge.has_bike || edge.has_ped) { has_bike_edge = 1; break; }
+                if (g_routing_mode == 1) {
+                    if (edge.has_ped) { has_bike_edge = 1; break; }
+                } else {
+                    if (edge.has_bike || edge.has_ped) { has_bike_edge = 1; break; }
+                }
             }
             
             if (has_bike_edge && d < best_bike_dist_sq) {
@@ -872,7 +927,11 @@ static uint32_t find_nearest_node(Tile *t, float lat, float lon) {
              ei < t->nodes[i].edge_index + t->nodes[i].edge_count && ei < t->edge_count; ei++) {
             Edge edge;
             if (!get_edge(t, ei, &edge)) continue;
-            if (edge.has_bike || edge.has_ped) { has_bike_edge = 1; break; }
+            if (g_routing_mode == 1) {
+                if (edge.has_ped) { has_bike_edge = 1; break; }
+            } else {
+                if (edge.has_bike || edge.has_ped) { has_bike_edge = 1; break; }
+            }
         }
         if (has_bike_edge && d < best_bike_dist_sq) { best_bike_dist_sq = d; best_bike = i; }
         if (d < best_dist_sq) { best_dist_sq = d; best = i; }
@@ -899,16 +958,31 @@ static void calculate_statistics(void) {
             Edge edge;
             if (!get_edge(t, ei, &edge)) continue;
             if (edge.end_tile_id == next.tile_id && edge.end_node_id == next.node_id) {
-                int is_path = (edge.use == USE_CYCLEWAY || edge.use == USE_PATH || 
-                               edge.use == USE_FOOTWAY || edge.use == USE_MOUNTAIN_BIKE);
-                int is_low_traffic = (edge.use == USE_TRACK || edge.use == USE_LIVING_STREET ||
-                                      edge.use == USE_SERVICE_ROAD);
-                if (!edge.has_bike && edge.has_ped) g_dist_pushing += edge.length;
-                else if (is_path && !edge.has_car) g_dist_car_free += edge.length;
-                else if (is_low_traffic) g_dist_car_free += edge.length;
-                else if (edge.cycle_lane >= 2) g_dist_separated += edge.length;
-                else if (edge.has_car) g_dist_with_cars += edge.length;
-                else g_dist_car_free += edge.length;
+                if (g_routing_mode == 1) {
+                    /* Pedestrian stats: track steps, paths, roads */
+                    if (edge.use == USE_STEPS) g_dist_steps += edge.length;
+                    else if (edge.use == USE_PATH || edge.use == USE_FOOTWAY || 
+                             edge.use == USE_CYCLEWAY || edge.use == USE_MOUNTAIN_BIKE)
+                        g_dist_car_free += edge.length;
+                    else if (edge.use == USE_TRACK || edge.use == USE_LIVING_STREET ||
+                             edge.use == USE_SERVICE_ROAD)
+                        g_dist_car_free += edge.length;
+                    else if (edge.has_car)
+                        g_dist_with_cars += edge.length;
+                    else
+                        g_dist_car_free += edge.length;
+                } else {
+                    int is_path = (edge.use == USE_CYCLEWAY || edge.use == USE_PATH || 
+                                   edge.use == USE_FOOTWAY || edge.use == USE_MOUNTAIN_BIKE);
+                    int is_low_traffic = (edge.use == USE_TRACK || edge.use == USE_LIVING_STREET ||
+                                          edge.use == USE_SERVICE_ROAD);
+                    if (!edge.has_bike && edge.has_ped) g_dist_pushing += edge.length;
+                    else if (is_path && !edge.has_car) g_dist_car_free += edge.length;
+                    else if (is_low_traffic) g_dist_car_free += edge.length;
+                    else if (edge.cycle_lane >= 2) g_dist_separated += edge.length;
+                    else if (edge.has_car) g_dist_with_cars += edge.length;
+                    else g_dist_car_free += edge.length;
+                }
                 break;
             }
         }
@@ -924,6 +998,7 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     visited_clear_both(); g_path_len = 0;
     g_dist_car_free = 0; g_dist_separated = 0;
     g_dist_with_cars = 0; g_dist_pushing = 0;
+    g_dist_steps = 0;
     
     Tile *start_tile = load_tile(start_tile_id);
     Tile *end_tile = load_tile(end_tile_id);
@@ -937,7 +1012,7 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
     Node *sn = &start_tile->nodes[start_node];
     float start_lat = sn->lat, start_lon = sn->lon;
     float init_dist = fast_distance(start_lat, start_lon, end_lat, end_lon);
-    float max_speed = 2.0f * kDefaultCyclingSpeed[g_bicycle_type];
+    float max_speed = (g_routing_mode == 1) ? 8.0f : 2.0f * kDefaultCyclingSpeed[g_bicycle_type];
     
     State start_state = { start_tile_id, start_node };
     State end_state = { end_tile_id, end_node };
@@ -1001,11 +1076,20 @@ static int route(uint32_t start_tile_id, uint32_t start_node,
                 Edge edge;
                 if (!get_edge(tile, ei, &edge)) continue;
                 if (edge.end_level != 2) continue;
-                if (!edge.has_bike && !edge.has_ped) continue;
-                if (edge.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                if (g_routing_mode == 1) {
+                    if (!edge.has_ped) continue;
+                } else {
+                    if (!edge.has_bike && !edge.has_ped) continue;
+                    if (edge.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                }
                 
-                float cost = edge_cost(&edge);
-                if (!edge.has_bike && edge.has_ped) cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                float cost;
+                if (g_routing_mode == 1) {
+                    cost = pedestrian_cost(&edge);
+                } else {
+                    cost = edge_cost(&edge);
+                    if (!edge.has_bike && edge.has_ped) cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                }
                 float new_g = cur.g + cost;
                 State ns = { edge.end_tile_id, edge.end_node_id };
                 VisitedEntry *nve = visited_find_fwd(ns);
@@ -1050,11 +1134,20 @@ do_backward:
                 Edge edge;
                 if (!get_edge(tile, ei, &edge)) continue;
                 if (edge.end_level != 2) continue;
-                if (!edge.has_bike && !edge.has_ped) continue;
-                if (edge.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                if (g_routing_mode == 1) {
+                    if (!edge.has_ped) continue;
+                } else {
+                    if (!edge.has_bike && !edge.has_ped) continue;
+                    if (edge.surface > kWorstAllowedSurface[g_bicycle_type]) continue;
+                }
                 
-                float cost = edge_cost(&edge);
-                if (!edge.has_bike && edge.has_ped) cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                float cost;
+                if (g_routing_mode == 1) {
+                    cost = pedestrian_cost(&edge);
+                } else {
+                    cost = edge_cost(&edge);
+                    if (!edge.has_bike && edge.has_ped) cost *= g_avoid_pushing ? 5.0f : 2.0f;
+                }
                 float new_g = cur.g + cost;
                 State ns = { edge.end_tile_id, edge.end_node_id };
                 VisitedEntry *nve = visited_find_bwd(ns);
@@ -1151,8 +1244,9 @@ do_backward:
 int main(int argc, char *argv[]) {
     if (argc < 6) {
         fprintf(stderr, "Usage: %s <tiles_dir> <from_lat> <from_lon> <to_lat> <to_lon> "
-                "[avoid_pushing] [avoid_cars] [use_roads] [bike_type]\n", argv[0]);
+                "[avoid_pushing] [avoid_cars] [use_roads] [bike_type] [mode]\n", argv[0]);
         fprintf(stderr, "  bike_type: 0=Road, 1=Cross, 2=Hybrid, 3=Mountain\n");
+        fprintf(stderr, "  mode: 0=bicycle (default), 1=pedestrian (alpine)\n");
         fprintf(stderr, "  NEON: %s (inline asm, no -mfpu needed)\n", HAS_NEON ? "YES" : "NO");
         fprintf(stderr, "  Hash: Robin Hood (power-of-2, %d entries)\n", VISITED_SIZE);
         return 1;
@@ -1166,16 +1260,20 @@ int main(int argc, char *argv[]) {
     if (argc > 7) g_avoid_cars = atoi(argv[7]);
     if (argc > 8) g_use_roads = (float)atof(argv[8]);
     if (argc > 9) g_bicycle_type = atoi(argv[9]);
+    if (argc > 10) g_routing_mode = atoi(argv[10]);
     
     if (g_use_roads < 0) g_use_roads = 0;
     if (g_use_roads > 1) g_use_roads = 1;
     if (g_bicycle_type < 0) g_bicycle_type = 0;
     if (g_bicycle_type > 3) g_bicycle_type = 3;
+    if (g_routing_mode < 0) g_routing_mode = 0;
+    if (g_routing_mode > 1) g_routing_mode = 1;
     
     const char *bike_names[] = {"Road", "Cross", "Hybrid", "Mountain"};
-    fprintf(stderr, "[ROUTE-NEON2] Options: avoid_pushing=%d avoid_cars=%d use_roads=%.2f bike=%s\n",
-            g_avoid_pushing, g_avoid_cars, g_use_roads, bike_names[g_bicycle_type]);
-    fprintf(stderr, "[ROUTE-NEON2] Build: NEON=inline-asm, 4-ary heap, Robin Hood hash, fused edges\n");
+    const char *mode_names[] = {"Bicycle", "Pedestrian"};
+    fprintf(stderr, "[ROUTE] Options: avoid_pushing=%d avoid_cars=%d use_roads=%.2f bike=%s mode=%s\n",
+            g_avoid_pushing, g_avoid_cars, g_use_roads, bike_names[g_bicycle_type], mode_names[g_routing_mode]);
+    fprintf(stderr, "[ROUTE] Build: NEON=inline-asm, 4-ary heap, Robin Hood hash, fused edges\n");
     
     g_heap_fwd = malloc(MAX_HEAP * sizeof(HeapEntry));
     g_heap_bwd = malloc(MAX_HEAP * sizeof(HeapEntry));
@@ -1220,9 +1318,12 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("], \"dist_car_free_km\": %.2f, \"dist_separated_km\": %.2f, "
-           "\"dist_with_cars_km\": %.2f, \"dist_pushing_km\": %.2f}\n",
+           "\"dist_with_cars_km\": %.2f, \"dist_pushing_km\": %.2f, "
+           "\"dist_steps_km\": %.2f, \"mode\": \"%s\"}\n",
            g_dist_car_free / 1000.0f, g_dist_separated / 1000.0f,
-           g_dist_with_cars / 1000.0f, g_dist_pushing / 1000.0f);
+           g_dist_with_cars / 1000.0f, g_dist_pushing / 1000.0f,
+           g_dist_steps / 1000.0f,
+           g_routing_mode == 1 ? "pedestrian" : "bicycle");
     
     for (int i = 0; i < g_tile_count; i++) { free(g_tiles[i].raw_data); free(g_tiles[i].nodes); }
     free(g_heap_fwd); free(g_heap_bwd);
